@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
 Custom Mininet OpenFlow 1.3 Topology for SDN Dynamic Firewall (Person B)
-Creates 1 Open vSwitch (s1) and 4 hosts (h1-h4), and configures s1 bridge
-interface (10.0.0.254/24) so the host OS controller can stream TCP logs to h4.
+Automatically starts the Centralized Security Event Logger on h4 (10.0.0.4:9999)
+and the Multi-Threaded TCP Server on h3 (10.0.0.3:8080) on boot.
 """
 
+import os
 import subprocess
+import time
 from mininet.cli import CLI
 from mininet.log import info, setLogLevel
 from mininet.net import Mininet
 from mininet.node import OVSSwitch, RemoteController
 from mininet.topo import Topo
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_SERVER_SCRIPT = os.path.join(BASE_DIR, "socket_app", "log_server.py")
+TCP_SERVER_SCRIPT = os.path.join(BASE_DIR, "socket_app", "tcp_server.py")
+LOG_FILE_PATH = os.path.join(BASE_DIR, "security_events.log")
 
 
 class FirewallTopo(Topo):
@@ -42,11 +49,26 @@ def run_topology():
     subprocess.run(["ip", "addr", "add", "10.0.0.254/24", "dev", "s1"], stderr=subprocess.DEVNULL)
     subprocess.run(["ip", "link", "set", "s1", "up"], stderr=subprocess.DEVNULL)
 
-    info("*** SDN Firewall Topology Ready:\n")
-    info("    h1 (10.0.0.1) : Authorized Client\n")
-    info("    h2 (10.0.0.2) : Restricted / Blacklisted Host\n")
-    info("    h3 (10.0.0.3) : Multi-Threaded TCP Server (Port 8080 Allowed, Port 4444 Forbidden)\n")
-    info("    h4 (10.0.0.4) : Centralized Security Event Logger (Port 9999)\n\n")
+    h3 = net.get("h3")
+    h4 = net.get("h4")
+
+    # Clean old log outputs
+    for fpath in ("/tmp/h4_logger.out", "/tmp/h3_server.out", LOG_FILE_PATH):
+        if os.path.exists(fpath):
+            os.remove(fpath)
+
+    info("*** Auto-starting Centralized Security Event Logger on h4 (10.0.0.4:9999)...\n")
+    h4.cmd(f"python3 -u {LOG_SERVER_SCRIPT} --host 0.0.0.0 --port 9999 --logfile {LOG_FILE_PATH} > /tmp/h4_logger.out 2>&1 &")
+
+    info("*** Auto-starting Multi-Threaded TCP Server on h3 (10.0.0.3:8080)...\n")
+    h3.cmd(f"python3 -u {TCP_SERVER_SCRIPT} > /tmp/h3_server.out 2>&1 &")
+
+    time.sleep(1.0)
+
+    info("*** Verifying background services:\n")
+    info(h4.cmd("cat /tmp/h4_logger.out"))
+    info(h3.cmd("cat /tmp/h3_server.out"))
+    info("\n*** SDN Firewall Topology & Services Ready! Run your client tests below:\n\n")
 
     CLI(net)
     net.stop()
