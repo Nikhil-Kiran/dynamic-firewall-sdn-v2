@@ -1,0 +1,22 @@
+{
+  "firewall_name": "SDN-Dynamic-OpenFlow13-Firewall",
+  "default_action": "ALLOW",
+  "drop_hard_timeout_sec": 30,
+  "allow_idle_timeout_sec": 60,
+  "logger_server": {
+    "ip": "10.0.0.4",
+    "port": 9999
+  },
+  "blocked_hosts": [
+    "10.0.0.2"
+  ],
+  "blocked_tcp_ports": [
+    4444,
+    23,
+    6667
+  ],
+  "allowed_tcp_ports": [
+    8080,
+    9999
+  ]
+}
