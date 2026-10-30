@@ -1,0 +1,37 @@
+{
+  "deliverable": "Deliverable 2 - Performance Evaluation & Comparison (Person C)",
+  "blocking_response_time_ms": {
+    "trials": [
+      34.2,
+      28.89,
+      35.23,
+      49.74,
+      32.85,
+      28.88,
+      33.97,
+      28.29,
+      29.49,
+      29.41
+    ],
+    "mean_ms": 33.09,
+    "min_ms": 28.29,
+    "max_ms": 49.74
+  },
+  "network_impact_comparison": {
+    "attack_burst_size": 80,
+    "with_dynamic_drop_rules": {
+      "controller_packet_in_count": 3,
+      "legitimate_socket_latency_ms": 2.46,
+      "legitimate_throughput_mbps": 46.8
+    },
+    "without_switch_level_blocking": {
+      "controller_packet_in_count": 80,
+      "legitimate_socket_latency_ms": 6.39,
+      "legitimate_throughput_mbps": 27.14
+    }
+  },
+  "plots_generated": [
+    "/home/anish/dynamic-firewall-sdn-v2/benchmarks/d2_blocking_response_time.png",
+    "/home/anish/dynamic-firewall-sdn-v2/benchmarks/d2_baseline_comparison.png"
+  ]
+}
