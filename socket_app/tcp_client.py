@@ -1,6 +1,7 @@
 import argparse
 import socket
 import sys
+import time
 
 
 def main():
@@ -10,10 +11,14 @@ def main():
     parser.add_argument("--messages", type=int, default=1, help="Number of messages")
     parser.add_argument(
         "--mode",
-        choices=["normal", "forbidden"],
+        choices=["normal", "forbidden", "rapid_scan", "flood"],
         default="normal",
         help="Traffic mode",
     )
+    parser.add_argument("--count", type=int, default=30,
+                        help="Number of attempts in flood mode")
+    parser.add_argument("--interval", type=float, default=0.02,
+                        help="Delay between flood attempts in seconds")
     args = parser.parse_args()
 
     if not 1 <= args.port <= 65535:
@@ -21,6 +26,34 @@ def main():
 
     if args.messages < 1:
         parser.error("--messages must be at least 1")
+
+    if args.count < 1 or args.interval < 0:
+        parser.error("--count must be positive and --interval cannot be negative")
+
+    if args.mode == "rapid_scan":
+        ports = [21, 22, 23, 80, 443, 4444, 5555, 6667, 8080, 9999]
+        print(f"[RAPID SCAN] Testing {len(ports)} TCP ports on {args.server_ip}")
+        for port in ports:
+            try:
+                with socket.create_connection((args.server_ip, port), timeout=0.4):
+                    print(f"[SCAN] Port {port}: open")
+            except (socket.timeout, ConnectionRefusedError, OSError):
+                print(f"[SCAN] Port {port}: closed/filtered")
+        print("[RAPID SCAN] Finished. Check the controller for [AUTO BLOCK].")
+        return
+
+    if args.mode == "flood":
+        print(f"[FLOOD TEST] Sending {args.count} rapid TCP connection attempts to {args.server_ip}:{args.port}")
+        for i in range(args.count):
+            try:
+                with socket.create_connection((args.server_ip, args.port), timeout=0.4):
+                    pass
+            except OSError:
+                pass
+            if args.interval:
+                time.sleep(args.interval)
+        print("[FLOOD TEST] Finished. Check the controller for [AUTO BLOCK].")
+        return
 
     if args.mode == "forbidden":
         print("[FORBIDDEN MODE] Testing traffic that the firewall should block.")

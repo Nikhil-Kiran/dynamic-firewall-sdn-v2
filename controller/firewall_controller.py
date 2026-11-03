@@ -42,6 +42,11 @@ class DynamicFirewallController(app_manager.OSKenApp):
         self.violation_counts = {}     # src_ip -> [timestamps]
         self.tcp_syn_timestamps = {}   # src_ip -> [timestamps]
 
+        # Additional configurable port-scan / TCP-flood detection state.
+        self.scan_activity = {}
+        self.dynamic_blocked_hosts = {}
+        self.attack_history = {}
+
         self._load_policy(force=True)
 
     def _load_policy(self, force: bool = False):
@@ -64,13 +69,78 @@ class DynamicFirewallController(app_manager.OSKenApp):
         """Exposes active dynamic quarantines so the Web UI can display them live."""
         try:
             now = time.time()
-            active_bans = [ip for ip, exp in self.dynamic_quarantine.items() if exp > now]
-            self.policy["dynamically_quarantined_hosts"] = active_bans
+            active_bans = {
+                ip for ip, exp in self.dynamic_quarantine.items() if exp > now
+            }
+            active_bans.update(
+                ip for ip, exp in self.dynamic_blocked_hosts.items() if exp > now
+            )
+            self.policy["dynamically_quarantined_hosts"] = sorted(active_bans)
             with open(POLICY_PATH, "w", encoding="utf-8") as f:
                 json.dump(self.policy, f, indent=2)
             self.policy_mtime = os.path.getmtime(POLICY_PATH)
         except Exception:
             pass
+
+    def _detect_abuse(self, src_ip, dst_ip, dst_port, tcp_pkt, datapath):
+        """Detect rapid port scans and TCP connection floods with escalating blocks."""
+        syn_only = (tcp_pkt.bits & tcp.TCP_SYN) and not (tcp_pkt.bits & tcp.TCP_ACK)
+        if not syn_only:
+            return False
+
+        now = time.time()
+        scan_window = int(self.policy.get("scan_window_sec", 10))
+        scan_threshold = int(self.policy.get("port_scan_threshold", 5))
+        flood_window = int(self.policy.get("flood_window_sec", 5))
+        flood_threshold = int(self.policy.get("flood_threshold", 20))
+
+        events = self.scan_activity.setdefault(src_ip, [])
+        events.append((now, dst_port))
+        events[:] = [(t, port) for t, port in events
+                     if now - t <= max(scan_window, flood_window)]
+
+        scan_ports = {port for t, port in events if now - t <= scan_window}
+        flood_count = sum(1 for t, _ in events if now - t <= flood_window)
+
+        attack_type = None
+        if len(scan_ports) >= scan_threshold:
+            attack_type = "port_scan"
+            reason = f"Port scan detected from {src_ip} ({len(scan_ports)} ports in {scan_window}s)"
+        elif flood_count >= flood_threshold:
+            attack_type = "tcp_flood"
+            reason = f"TCP connection flood detected from {src_ip} ({flood_count} attempts in {flood_window}s)"
+        else:
+            return False
+
+        repeat_window = int(self.policy.get("repeat_attack_window_sec", 300))
+        history = self.attack_history.setdefault(src_ip, [])
+        history[:] = [t for t in history if now - t <= repeat_window]
+        history.append(now)
+
+        repeat_threshold = int(self.policy.get("repeat_attack_threshold", 2))
+        if len(history) >= repeat_threshold:
+            block_timeout = int(self.policy.get("repeat_attack_block_sec", 120))
+            reason += f"; repeat attack #{len(history)} within {repeat_window}s"
+        elif attack_type == "port_scan":
+            block_timeout = int(self.policy.get("port_scan_block_sec", 30))
+        else:
+            block_timeout = int(self.policy.get("tcp_flood_block_sec", 60))
+
+        self.dynamic_blocked_hosts[src_ip] = now + block_timeout
+        match = datapath.ofproto_parser.OFPMatch(
+            eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip
+        )
+        self._add_flow(
+            datapath, priority=200, match=match, actions=[], hard_timeout=block_timeout
+        )
+        self._sync_dynamic_state_to_policy_file()
+        print(f"[AUTO BLOCK] {reason} (blocked for {block_timeout}s)", flush=True)
+        self._emit_alert_once(
+            src_ip=src_ip, dst_ip=dst_ip, dst_port=dst_port,
+            src_port=tcp_pkt.src_port, action="AUTO_BLOCK",
+            reason=reason, protocol="TCP", timeout_sec=block_timeout,
+        )
+        return True
 
     def _add_flow(self, datapath, priority, match, actions, buffer_id=None, idle_timeout=0, hard_timeout=0):
         ofproto = datapath.ofproto
@@ -234,9 +304,25 @@ class DynamicFirewallController(app_manager.OSKenApp):
                 datapath.send_msg(out)
                 return
 
+            # Expire custom temporary blocks and refresh the Web UI state when needed.
+            expired_custom_block = (
+                src_ip in self.dynamic_blocked_hosts
+                and self.dynamic_blocked_hosts[src_ip] <= time.time()
+            )
+            if expired_custom_block:
+                self.dynamic_blocked_hosts.pop(src_ip, None)
+                self._sync_dynamic_state_to_policy_file()
+
+            # Apply configurable port-scan / fast-flood detection before legacy IPS checks.
+            # This ensures the configured 30s / 60s / repeat-offence durations are used.
+            if tcp_pkt and src_ip not in blocked_hosts:
+                if self._detect_abuse(src_ip, dst_ip, tcp_pkt.dst_port, tcp_pkt, datapath):
+                    return
+
             # CHECK 1: Dynamically Quarantined Host OR Policy-Blocked Host
             is_dynamically_banned = self._is_dynamically_quarantined(src_ip)
-            if is_dynamically_banned or src_ip in blocked_hosts:
+            is_custom_blocked = self.dynamic_blocked_hosts.get(src_ip, 0) > time.time()
+            if is_dynamically_banned or is_custom_blocked or src_ip in blocked_hosts:
                 dst_port = tcp_pkt.dst_port if tcp_pkt else 0
                 src_port = tcp_pkt.src_port if tcp_pkt else 0
                 proto_name = "TCP" if tcp_pkt else ("ICMP" if proto == in_proto.IPPROTO_ICMP else "IPv4")
@@ -244,11 +330,22 @@ class DynamicFirewallController(app_manager.OSKenApp):
                 match = parser.OFPMatch(
                     eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=dst_ip
                 )
-                self._add_flow(datapath, priority=100, match=match, actions=[], hard_timeout=drop_timeout)
+                host_drop_timeout = drop_timeout
+                if is_custom_blocked:
+                    host_drop_timeout = max(
+                        1, int(self.dynamic_blocked_hosts[src_ip] - time.time())
+                    )
+                self._add_flow(
+                    datapath, priority=100, match=match, actions=[],
+                    hard_timeout=host_drop_timeout
+                )
 
                 if is_dynamically_banned:
                     reason = f"Dynamically quarantined attacker {src_ip} blocked from accessing {dst_ip}:{dst_port}"
                     action_label = "DYNAMIC_HOST_BLOCKED"
+                elif is_custom_blocked:
+                    reason = f"Automatically blocked attacker {src_ip} blocked from accessing {dst_ip}:{dst_port}"
+                    action_label = "AUTO_BLOCK_ACTIVE"
                 else:
                     reason = f"Policy-blocked source host {src_ip} blocked from accessing {dst_ip}"
                     action_label = "HOST_BLOCKED"
@@ -270,32 +367,6 @@ class DynamicFirewallController(app_manager.OSKenApp):
             if tcp_pkt:
                 src_port = tcp_pkt.src_port
                 dst_port = tcp_pkt.dst_port
-
-                # Detect rapid TCP SYN flood (> max_syn_rate in 10s)
-                if (tcp_pkt.bits & tcp.TCP_SYN) and not (tcp_pkt.bits & tcp.TCP_ACK):
-                    if self._check_syn_flood_rate(src_ip, max_syn_rate, quarantine_sec):
-                        match_host = parser.OFPMatch(
-                            eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=dst_ip
-                        )
-                        self._add_flow(
-                            datapath, priority=100, match=match_host, actions=[], hard_timeout=quarantine_sec
-                        )
-                        reason = (
-                            f"Host {src_ip} exceeded TCP SYN rate limit (>{max_syn_rate} connections/10s) -> "
-                            f"Dynamically Quarantined for {quarantine_sec}s"
-                        )
-                        print(f"[DYNAMIC IPS QUARANTINE] {reason}", flush=True)
-                        self._emit_alert_once(
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            dst_port=dst_port,
-                            src_port=src_port,
-                            action="DYNAMIC_DOS_QUARANTINE",
-                            reason=reason,
-                            protocol="TCP",
-                            timeout_sec=quarantine_sec,
-                        )
-                        return
 
                 # Detect forbidden port access (4444, 23, 6667)
                 if dst_port in blocked_ports:
