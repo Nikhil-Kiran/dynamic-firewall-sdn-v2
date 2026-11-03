@@ -1,15 +1,19 @@
 {
-  "firewall_name": "SDN-Dynamic-OpenFlow13-Firewall",
+  "firewall_name": "SDN-Dynamic-OpenFlow13-IPS-Firewall",
   "default_action": "ALLOW",
   "drop_hard_timeout_sec": 30,
   "allow_idle_timeout_sec": 60,
+  "dynamic_ips_settings": {
+    "auto_quarantine_on_forbidden_port": true,
+    "max_violations_before_host_ban": 2,
+    "max_tcp_syn_rate_per_10s": 8,
+    "quarantine_duration_sec": 30
+  },
   "logger_server": {
     "ip": "10.0.0.4",
     "port": 9999
   },
-  "blocked_hosts": [
-    "10.0.0.2"
-  ],
+  "blocked_hosts": [],
   "blocked_tcp_ports": [
     4444,
     23,
@@ -18,5 +22,8 @@
   "allowed_tcp_ports": [
     8080,
     9999
+  ],
+  "dynamically_quarantined_hosts": [
+    "10.0.0.2"
   ]
 }
