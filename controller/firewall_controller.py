@@ -50,6 +50,14 @@ class DynamicFirewallController(app_manager.OSKenApp):
         self._load_policy(force=True)
 
     def _load_policy(self, force: bool = False):
+        if os.path.exists("/tmp/sdn_reset_quarantine"):
+            self.dynamic_quarantine.clear()
+            self.violation_counts.clear()
+            self.tcp_syn_timestamps.clear()
+            try:
+                os.remove("/tmp/sdn_reset_quarantine")
+            except Exception:
+                pass
         try:
             mtime = os.path.getmtime(POLICY_PATH)
             if force or mtime > self.policy_mtime:
