@@ -2,10 +2,10 @@
 """
 UNIVERSAL SINGLE-COMMAND MASTER ORCHESTRATOR (start_everything.py)
 1. Auto-detects any teammate's Linux user, home directory, and display.
-2. Cleans stale Mininet state and frees ports 5000 / 6653.
+2. Cleans stale Mininet state and frees ports 5000 / 6653 / 9999.
 3. Finds or auto-installs os-ken in a local venv.
 4. Boots OS-Ken OpenFlow 1.3 Controller and Mininet Topology (s1, h1-h4).
-5. Configures static ARP and priority=200 OVS hardware telemetry rules (zero logger timeout).
+5. Configures static ARP and narrow priority=200 OVS telemetry rules on port 9999.
 6. Starts Centralized SOC Logger (h4:9999 + root fallback) and TCP Server (h3:8080).
 7. Registers host PIDs (/tmp/mininet_host_pids.json) for real mnexec browser packet execution.
 8. Launches Web Control Plane on http://127.0.0.1:5000 and auto-opens Firefox.
@@ -84,7 +84,7 @@ HOST_PIDS_FILE = "/tmp/mininet_host_pids.json"
 
 
 def configure_zero_timeout_telemetry(net):
-    """Configures s1 root bridge + static ARP + priority=200 OVS rules so h4:9999 never times out."""
+    """Configures s1 root bridge + static ARP + port-9999 OVS rules so h4:9999 never times out."""
     subprocess.run(["ovs-vsctl", "set", "Bridge", "s1", "protocols=OpenFlow13"], stderr=subprocess.DEVNULL)
     subprocess.run(["ip", "link", "set", "s1", "address", "00:00:00:00:00:fe"], stderr=subprocess.DEVNULL)
     subprocess.run(["ip", "addr", "flush", "dev", "s1"], stderr=subprocess.DEVNULL)
@@ -104,13 +104,13 @@ def configure_zero_timeout_telemetry(net):
         for idx in range(1, 5):
             h.cmd(f"arp -s 10.0.0.{idx} 00:00:00:00:00:0{idx}")
 
-    # High-priority OVS rules so controller <-> h4:9999 telemetry bypasses PacketIn completely
+    # Narrow priority=200 OVS rules strictly for controller (10.0.0.254) <-> h4:9999 TCP telemetry
     subprocess.run(
-        ["ovs-ofctl", "-O", "OpenFlow13", "add-flow", "s1", "priority=200,ip,nw_dst=10.0.0.4,actions=output:4"],
+        ["ovs-ofctl", "-O", "OpenFlow13", "add-flow", "s1", "priority=200,tcp,nw_src=10.0.0.254,nw_dst=10.0.0.4,tp_dst=9999,actions=output:4"],
         stderr=subprocess.DEVNULL,
     )
     subprocess.run(
-        ["ovs-ofctl", "-O", "OpenFlow13", "add-flow", "s1", "priority=200,ip,nw_src=10.0.0.4,nw_dst=10.0.0.254,actions=LOCAL"],
+        ["ovs-ofctl", "-O", "OpenFlow13", "add-flow", "s1", "priority=200,tcp,nw_src=10.0.0.4,nw_dst=10.0.0.254,tp_src=9999,actions=LOCAL"],
         stderr=subprocess.DEVNULL,
     )
     subprocess.run(

@@ -369,7 +369,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <div class="tabs-bar">
   <button class="tab-btn active" onclick="switchTab('pane-control', this)">Live Control Plane &amp; Real Packet Simulator</button>
-  <button class="tab-btn" onclick="switchTab('pane-benchmarks', this)">Deliverable 2 Performance Benchmarks (Graphs)</button>
+  <button class="tab-btn" onclick="switchTab('pane-benchmarks', this)">System Performance Performance Benchmarks (Graphs)</button>
 </div>
 
 <main class="container">
@@ -483,10 +483,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </section>
   </div>
 
-  <!-- PANE 2: Deliverable 2 Performance Benchmarks -->
+  <!-- PANE 2: System Performance Performance Benchmarks -->
   <div class="tab-pane" id="pane-benchmarks">
     <div class="card" style="margin-bottom:16px;">
-      <div class="section-title">Deliverable 2 Performance Evaluation &amp; Comparison (5 Marks)</div>
+      <div class="section-title">System Performance Evaluation &amp; Security Benchmarks</div>
       <p style="font-size:13px;color:var(--text-secondary);margin-top:4px;">
         Evaluates blocking response times and compares control-plane overhead, client RTT latency, and bulk TCP throughput with vs. without switch-level OpenFlow drop rules.
       </p>
