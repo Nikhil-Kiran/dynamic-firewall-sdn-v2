@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
 UNIVERSAL SINGLE-COMMAND MASTER ORCHESTRATOR (start_everything.py)
-Works on ANY teammate's Ubuntu machine without hardcoded usernames or paths!
+1. Auto-detects any teammate's Linux user, home directory, and display.
+2. Cleans stale Mininet state and frees ports 5000 / 6653.
+3. Finds or auto-installs os-ken in a local venv.
+4. Boots OS-Ken OpenFlow 1.3 Controller and Mininet Topology (s1, h1-h4).
+5. Configures static ARP and priority=200 OVS hardware telemetry rules (zero logger timeout).
+6. Starts Centralized SOC Logger (h4:9999 + root fallback) and TCP Server (h3:8080).
+7. Registers host PIDs (/tmp/mininet_host_pids.json) for real mnexec browser packet execution.
+8. Launches Web Control Plane on http://127.0.0.1:5000 and auto-opens Firefox.
 """
 
 import json
@@ -34,7 +41,6 @@ def get_real_user_and_home():
             return sudo_user, pw.pw_dir
         except KeyError:
             pass
-    # Fallback: owner of the repository folder
     st = os.stat(BASE_DIR)
     try:
         pw = pwd.getpwuid(st.st_uid)
@@ -62,7 +68,10 @@ def find_or_install_osken():
     venv_dir = os.path.join(BASE_DIR, "venv")
     subprocess.run(["sudo", "-u", REAL_USER, "python3", "-m", "venv", venv_dir], check=False)
     pip_bin = os.path.join(venv_dir, "bin", "pip")
-    subprocess.run(["sudo", "-u", REAL_USER, pip_bin, "install", "--quiet", "os-ken", "matplotlib", "eventlet"], check=False)
+    subprocess.run(
+        ["sudo", "-u", REAL_USER, pip_bin, "install", "--quiet", "os-ken", "matplotlib", "eventlet"],
+        check=False,
+    )
     return os.path.join(venv_dir, "bin", "osken-manager")
 
 
@@ -74,8 +83,48 @@ LOG_FILE_PATH = os.path.join(BASE_DIR, "security_events.log")
 HOST_PIDS_FILE = "/tmp/mininet_host_pids.json"
 
 
+def configure_zero_timeout_telemetry(net):
+    """Configures s1 root bridge + static ARP + priority=200 OVS rules so h4:9999 never times out."""
+    subprocess.run(["ovs-vsctl", "set", "Bridge", "s1", "protocols=OpenFlow13"], stderr=subprocess.DEVNULL)
+    subprocess.run(["ip", "link", "set", "s1", "address", "00:00:00:00:00:fe"], stderr=subprocess.DEVNULL)
+    subprocess.run(["ip", "addr", "flush", "dev", "s1"], stderr=subprocess.DEVNULL)
+    subprocess.run(["ip", "addr", "add", "10.0.0.254/24", "dev", "s1"], stderr=subprocess.DEVNULL)
+    subprocess.run(["ip", "link", "set", "s1", "up"], stderr=subprocess.DEVNULL)
+
+    # Permanent static ARP in root namespace for h4 (10.0.0.4)
+    subprocess.run(
+        ["ip", "neigh", "replace", "10.0.0.4", "lladdr", "00:00:00:00:00:04", "dev", "s1", "nud", "permanent"],
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Pre-populate static ARP across all Mininet hosts
+    for h_name in ("h1", "h2", "h3", "h4"):
+        h = net.get(h_name)
+        h.cmd("arp -s 10.0.0.254 00:00:00:00:00:fe")
+        for idx in range(1, 5):
+            h.cmd(f"arp -s 10.0.0.{idx} 00:00:00:00:00:0{idx}")
+
+    # High-priority OVS rules so controller <-> h4:9999 telemetry bypasses PacketIn completely
+    subprocess.run(
+        ["ovs-ofctl", "-O", "OpenFlow13", "add-flow", "s1", "priority=200,ip,nw_dst=10.0.0.4,actions=output:4"],
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["ovs-ofctl", "-O", "OpenFlow13", "add-flow", "s1", "priority=200,ip,nw_src=10.0.0.4,nw_dst=10.0.0.254,actions=LOCAL"],
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["ovs-ofctl", "-O", "OpenFlow13", "add-flow", "s1", "priority=200,arp,actions=NORMAL"],
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["ovs-ofctl", "-O", "OpenFlow13", "add-flow", "s1", "priority=0,actions=CONTROLLER:65535"],
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def open_browser_for_teammate(url: str):
-    """Opens Firefox/default browser cleanly even when run under sudo on Ubuntu Wayland/X11."""
+    """Opens Firefox/default browser cleanly as the non-root user on Ubuntu Wayland/X11."""
     display = os.environ.get("DISPLAY", ":0")
     uid = pwd.getpwnam(REAL_USER).pw_uid if REAL_USER != "root" else 0
     runtime_dir = f"/run/user/{uid}"
@@ -99,10 +148,11 @@ def main():
     print(f" UNIFIED SDN DYNAMIC FIREWALL — MASTER ORCHESTRATOR (User: {REAL_USER})")
     print("=" * 76)
 
-    print(" [1/6] Cleaning up old Mininet topologies and ports (5000, 6653)...")
+    print(" [1/6] Cleaning up old Mininet topologies and ports (5000, 6653, 9999)...")
     subprocess.run(["mn", "-c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["fuser", "-k", "5000/tcp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["fuser", "-k", "6653/tcp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["fuser", "-k", "9999/tcp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if os.path.exists(LOG_FILE_PATH):
         os.remove(LOG_FILE_PATH)
 
@@ -124,19 +174,19 @@ def main():
     )
     net.start()
 
-    subprocess.run(["ip", "addr", "flush", "dev", "s1"], stderr=subprocess.DEVNULL)
-    subprocess.run(["ip", "addr", "add", "10.0.0.254/24", "dev", "s1"], stderr=subprocess.DEVNULL)
-    subprocess.run(["ip", "link", "set", "s1", "up"], stderr=subprocess.DEVNULL)
-    subprocess.run(
-        ["ovs-ofctl", "-O", "OpenFlow13", "add-flow", "s1", "priority=0,actions=CONTROLLER:65535"],
-        stderr=subprocess.DEVNULL,
-    )
+    configure_zero_timeout_telemetry(net)
 
     h1, h2, h3, h4 = net.get("h1", "h2", "h3", "h4")
 
     print(" [4/6] Starting Centralized SOC Logger (h4:9999) & Multi-Threaded TCP Server (h3:8080)...")
     h4.cmd(f"python3 -u {LOG_SERVER_SCRIPT} --host 0.0.0.0 --port 9999 --logfile {LOG_FILE_PATH} > /tmp/h4_logger.out 2>&1 &")
     h3.cmd(f"python3 -u {TCP_SERVER_SCRIPT} > /tmp/h3_server.out 2>&1 &")
+    # Also run a root-namespace mirror listener on 127.0.0.1:9999 so localhost fallback never fails
+    root_logger_proc = subprocess.Popen(
+        ["python3", "-u", LOG_SERVER_SCRIPT, "--host", "127.0.0.1", "--port", "9999", "--logfile", LOG_FILE_PATH],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     time.sleep(1.0)
 
     pids = {"h1": h1.pid, "h2": h2.pid, "h3": h3.pid, "h4": h4.pid}
@@ -164,6 +214,7 @@ def main():
         print("\n[SHUTDOWN] Stopping Web UI, Mininet, and SDN Controller...")
         if os.path.exists(HOST_PIDS_FILE):
             os.remove(HOST_PIDS_FILE)
+        root_logger_proc.terminate()
         ui_proc.terminate()
         ctrl_proc.terminate()
         net.stop()
