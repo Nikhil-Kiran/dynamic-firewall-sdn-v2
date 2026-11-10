@@ -2,14 +2,13 @@
 #!/usr/bin/env python3
 """
 SDN Dynamic Firewall & Behavioral IPS Controller (OpenFlow 1.3 / OS-Ken)
-Fulfills all 7 Rubric Expectations:
-  1. TCP client/server communication forwarding (h1, h2 <-> h3:8080)
-  2. Traffic classification by source IP, destination IP, and TCP/UDP port
-  3. Dynamic firewall rule installation on switch s1 (priority=10 ALLOW, priority=100 DROP)
-  4. Centralized security-event logger telemetry to h4 (10.0.0.4:9999) + security_events.log
-  5. Multi-client support (concurrent flows for h1, h2, h3, h4)
-  6. Automatic blocking (2-strike dynamic quarantine / SYN flood) & 30s self-healing recovery
-  7. Sub-40ms hardware flow-mod response time for Deliverable 2 benchmarks
+1. TCP client/server communication forwarding (h1, h2 <-> h3:8080)
+2. Traffic classification by source IP, destination IP, and TCP/UDP port
+3. Dynamic firewall rule installation on switch s1 (priority=10 ALLOW, priority=100 DROP)
+4. Centralized security-event logger telemetry to h4 (10.0.0.4:9999) + security_events.log
+5. Multi-client support (concurrent flows for h1, h2, h3, h4)
+6. Automatic blocking (2-strike dynamic quarantine / SYN flood) & 30s self-healing recovery
+7. Sub-40ms hardware flow-mod response time
 """
 
 import json
@@ -21,7 +20,7 @@ from os_ken.base import app_manager
 from os_ken.controller import ofp_event
 from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from os_ken.ofproto import ofproto_v1_3
-from os_ken.lib.packet import ethernet, ether_types, ipv4, tcp, udp, arp
+from os_ken.lib.packet import ethernet, ether_types, ipv4, tcp
 
 from log_client import send_security_event
 
@@ -42,7 +41,7 @@ class DynamicFirewallController(app_manager.OSKenApp):
         # Behavioral IPS state (Zero hardcoding: all hosts start AUTHORIZED)
         self.violation_counts = defaultdict(int)
         self.dynamic_quarantine = {}  # ip -> expiry_timestamp
-        self.tcp_syn_timestamps = defaultdict( lambda: deque(maxlen=200) )
+        self.tcp_syn_timestamps = defaultdict(lambda: deque(maxlen=200))
 
         self._load_policy(force=True)
 
@@ -154,7 +153,7 @@ class DynamicFirewallController(app_manager.OSKenApp):
         in_port = msg.match["in_port"]
 
         pkt = ethernet.ethernet(msg.data)
-        if pkt.ethertype == ether_types.ETH_TYPE_LLDP or pkt.ethertype == ether_types.ETH_TYPE_IPV6:
+        if pkt.ethertype in (ether_types.ETH_TYPE_LLDP, ether_types.ETH_TYPE_IPV6):
             return
 
         dpid = datapath.id
