@@ -76,6 +76,10 @@ class DynamicFirewallController(app_manager.OSKenApp):
                 ip for ip, exp in self.dynamic_blocked_hosts.items() if exp > now
             )
             self.policy["dynamically_quarantined_hosts"] = sorted(active_bans)
+            expiry_map = {}
+            expiry_map.update({ip: exp for ip, exp in self.dynamic_quarantine.items() if exp > now})
+            expiry_map.update({ip: exp for ip, exp in self.dynamic_blocked_hosts.items() if exp > now})
+            self.policy["dynamic_block_expiry"] = expiry_map
             with open(POLICY_PATH, "w", encoding="utf-8") as f:
                 json.dump(self.policy, f, indent=2)
             self.policy_mtime = os.path.getmtime(POLICY_PATH)
@@ -126,18 +130,26 @@ class DynamicFirewallController(app_manager.OSKenApp):
         else:
             block_timeout = int(self.policy.get("tcp_flood_block_sec", 60))
 
-        self.dynamic_blocked_hosts[src_ip] = now + block_timeout
-        match = datapath.ofproto_parser.OFPMatch(
-            eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip
-        )
-        self._add_flow(
-            datapath, priority=200, match=match, actions=[], hard_timeout=block_timeout
-        )
-        self._sync_dynamic_state_to_policy_file()
-        print(f"[AUTO BLOCK] {reason} (blocked for {block_timeout}s)", flush=True)
+        test_override = self.policy.get("dashboard_test_timeout_sec")
+        if test_override is not None:
+            block_timeout = max(0, int(test_override))
+        if block_timeout > 0:
+            self.dynamic_blocked_hosts[src_ip] = now + block_timeout
+            match = datapath.ofproto_parser.OFPMatch(
+                eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip
+            )
+            self._add_flow(
+                datapath, priority=200, match=match, actions=[], hard_timeout=block_timeout
+            )
+            self._sync_dynamic_state_to_policy_file()
+            print(f"[AUTO BLOCK] {reason} (blocked for {block_timeout}s)", flush=True)
+            action = "AUTO_BLOCK"
+        else:
+            print(f"[AUTO DETECT ONLY] {reason} (dashboard test override: no block)", flush=True)
+            action = "ATTACK_DETECTED"
         self._emit_alert_once(
             src_ip=src_ip, dst_ip=dst_ip, dst_port=dst_port,
-            src_port=tcp_pkt.src_port, action="AUTO_BLOCK",
+            src_port=tcp_pkt.src_port, action=action,
             reason=reason, protocol="TCP", timeout_sec=block_timeout,
         )
         return True
@@ -286,6 +298,11 @@ class DynamicFirewallController(app_manager.OSKenApp):
             max_violations = int(ips_cfg.get("max_violations_before_host_ban", 2))
             max_syn_rate = int(ips_cfg.get("max_tcp_syn_rate_per_10s", 8))
             quarantine_sec = int(ips_cfg.get("quarantine_duration_sec", drop_timeout))
+            test_timeout = self.policy.get("dashboard_test_timeout_sec")
+            if test_timeout is not None:
+                test_timeout = max(0, int(test_timeout))
+                drop_timeout = test_timeout
+                quarantine_sec = test_timeout
 
             tcp_pkt = pkt.get_protocol(tcp.tcp)
 
@@ -375,24 +392,35 @@ class DynamicFirewallController(app_manager.OSKenApp):
                     )
 
                     if quarantined_now:
-                        # Strike 2 reached -> Escalate to full-host quarantine across ALL ports (including 8080!)
-                        match_host = parser.OFPMatch(
-                            eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip, ipv4_dst=dst_ip
-                        )
-                        self._add_flow(
-                            datapath, priority=100, match=match_host, actions=[], hard_timeout=quarantine_sec
-                        )
-                        reason = (
-                            f"Host {src_ip} triggered {max_violations} port violations (probed port {dst_port}) -> "
-                            f"Dynamically Quarantined from ALL ports for {quarantine_sec}s"
-                        )
-                        print(f"[DYNAMIC IPS QUARANTINE] {reason}", flush=True)
+                        # Strike 2 reached -> full-host quarantine across all ports.
+                        if quarantine_sec > 0:
+                            match_host = parser.OFPMatch(
+                                eth_type=ether_types.ETH_TYPE_IP, ipv4_src=src_ip
+                            )
+                            self._add_flow(
+                                datapath, priority=100, match=match_host, actions=[], hard_timeout=quarantine_sec
+                            )
+                            self.dynamic_quarantine[src_ip] = time.time() + quarantine_sec
+                            self._sync_dynamic_state_to_policy_file()
+                            reason = (
+                                f"Host {src_ip} triggered {max_violations} port violations (probed port {dst_port}) -> "
+                                f"Dynamically Quarantined from ALL ports for {quarantine_sec}s"
+                            )
+                            print(f"[DYNAMIC IPS QUARANTINE] {reason}", flush=True)
+                            action = "DYNAMIC_HOST_QUARANTINED"
+                        else:
+                            reason = (
+                                f"Host {src_ip} reached {max_violations} forbidden-port strikes; "
+                                "quarantine suppressed by dashboard no-block test override"
+                            )
+                            print(f"[DYNAMIC IPS DETECTED] {reason}", flush=True)
+                            action = "QUARANTINE_DETECTED_ONLY"
                         self._emit_alert_once(
                             src_ip=src_ip,
                             dst_ip=dst_ip,
                             dst_port=dst_port,
                             src_port=src_port,
-                            action="DYNAMIC_HOST_QUARANTINED",
+                            action=action,
                             reason=reason,
                             protocol="TCP",
                             timeout_sec=quarantine_sec,
@@ -406,21 +434,27 @@ class DynamicFirewallController(app_manager.OSKenApp):
                             ipv4_dst=dst_ip,
                             tcp_dst=dst_port,
                         )
-                        self._add_flow(
-                            datapath, priority=100, match=match_port, actions=[], hard_timeout=drop_timeout
-                        )
+                        if drop_timeout > 0:
+                            self._add_flow(
+                                datapath, priority=100, match=match_port, actions=[], hard_timeout=drop_timeout
+                            )
                         strikes = len(self.violation_counts.get(src_ip, []))
                         reason = (
                             f"Forbidden TCP port {dst_port} blocked ({src_ip} -> {dst_ip}:{dst_port}) "
                             f"[Strike {strikes}/{max_violations}]"
                         )
-                        print(f"[FIREWALL DROP] {reason} (priority=100, hard_timeout={drop_timeout}s)", flush=True)
+                        if drop_timeout > 0:
+                            print(f"[FIREWALL DROP] {reason} (priority=100, hard_timeout={drop_timeout}s)", flush=True)
+                            action = "DROP_FLOW_INSTALLED"
+                        else:
+                            print(f"[FIREWALL DETECT ONLY] {reason} (dashboard no-block override)", flush=True)
+                            action = "FORBIDDEN_PORT_DETECTED"
                         self._emit_alert_once(
                             src_ip=src_ip,
                             dst_ip=dst_ip,
                             dst_port=dst_port,
                             src_port=src_port,
-                            action="DROP_FLOW_INSTALLED",
+                            action=action,
                             reason=reason,
                             protocol="TCP",
                             timeout_sec=drop_timeout,

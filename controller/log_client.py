@@ -16,7 +16,7 @@ DEFAULT_LOGGER_IP = os.environ.get("SDN_LOGGER_IP", "10.0.0.4")
 DEFAULT_LOGGER_PORT = int(os.environ.get("SDN_LOGGER_PORT", "9999"))
 
 
-def _transmit_event_sync(payload: dict, logger_ip: str, logger_port: int, timeout: float = 2.0) -> bool:
+def _transmit_event_sync(payload: dict, logger_ip: str, logger_port: int, timeout: float = 5.0) -> bool:
     """Internal synchronous helper transmitting JSON telemetry over TCP."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -24,10 +24,23 @@ def _transmit_event_sync(payload: dict, logger_ip: str, logger_port: int, timeou
             sock.connect((logger_ip, logger_port))
             message = json.dumps(payload) + "\n"
             sock.sendall(message.encode("utf-8"))
-            _ = sock.recv(256)
+            response = b""
+            while b"\n" not in response and len(response) < 4096:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                response += chunk
+            if not response:
+                raise socket.timeout("Logger did not acknowledge the event")
+            try:
+                ack = json.loads(response.split(b"\n", 1)[0].decode("utf-8"))
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise OSError(f"Invalid logger acknowledgement: {exc}") from exc
+            if ack.get("status") != "ACK":
+                raise OSError(f"Logger rejected event: {ack}")
         return True
     except (socket.timeout, ConnectionRefusedError, OSError) as exc:
-        print(f"[LOG_CLIENT WARN] Unable to deliver security event to Logger at {logger_ip}:{logger_port} -> {exc}")
+        print(f"[LOG_CLIENT WARN] Unable to deliver security event to Logger at {logger_ip}:{logger_port} -> {exc}", flush=True)
         return False
 
 

@@ -6,6 +6,7 @@ and the Multi-Threaded TCP Server on h3 (10.0.0.3:8080) on boot.
 """
 
 import os
+import json
 import subprocess
 import time
 from mininet.cli import CLI
@@ -18,6 +19,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_SERVER_SCRIPT = os.path.join(BASE_DIR, "socket_app", "log_server.py")
 TCP_SERVER_SCRIPT = os.path.join(BASE_DIR, "socket_app", "tcp_server.py")
 LOG_FILE_PATH = os.path.join(BASE_DIR, "security_events.log")
+PID_FILE_PATH = "/tmp/dynamic-firewall-mininet-pids.json"
 
 
 class FirewallTopo(Topo):
@@ -43,6 +45,16 @@ def run_topology():
     )
 
     net.start()
+
+    # Publish real Mininet host shell PIDs for the dashboard's namespace runner.
+    # The dashboard uses these PIDs with mnexec -a; it never fabricates traffic.
+    try:
+        with open(PID_FILE_PATH, "w", encoding="utf-8") as pid_file:
+            json.dump({name: net.get(name).pid for name in ("h1", "h2", "h3", "h4")}, pid_file)
+        os.chmod(PID_FILE_PATH, 0o644)
+        info(f"*** Dashboard host PID registry written to {PID_FILE_PATH}\n")
+    except Exception as exc:
+        info(f"*** WARNING: Could not write dashboard PID registry: {exc}\n")
 
     info("\n*** Configuring root-bridge interface on s1 (10.0.0.254/24) for SDN-to-Logger telemetry...\n")
     subprocess.run(["ip", "addr", "flush", "dev", "s1"], stderr=subprocess.DEVNULL)
@@ -72,6 +84,11 @@ def run_topology():
 
     CLI(net)
     net.stop()
+    try:
+        if os.path.exists(PID_FILE_PATH):
+            os.remove(PID_FILE_PATH)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

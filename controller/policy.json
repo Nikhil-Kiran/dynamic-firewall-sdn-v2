@@ -26,7 +26,7 @@
     9999
   ],
   "dynamically_quarantined_hosts": [
-    "10.0.0.2"
+    "10.0.0.1"
   ],
   "port_scan_threshold": 5,
   "scan_window_sec": 10,
@@ -36,5 +36,9 @@
   "tcp_flood_block_sec": 60,
   "repeat_attack_block_sec": 120,
   "repeat_attack_window_sec": 300,
-  "repeat_attack_threshold": 2
+  "repeat_attack_threshold": 2,
+  "dashboard_test_timeout_sec": null,
+  "dynamic_block_expiry": {
+    "10.0.0.1": 1794376703.413187
+  }
 }

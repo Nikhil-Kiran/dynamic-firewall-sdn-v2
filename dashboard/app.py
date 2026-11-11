@@ -15,7 +15,7 @@ import re
 import socket
 import subprocess
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -31,37 +31,10 @@ except Exception:
     send_security_event = None
 
 
-def get_ovs_flows():
-    """Reads live OpenFlow 1.3 rules from switch s1 (or returns structured fallback if Mininet isn't running)."""
-    res = subprocess.run(
-        ["sudo", "-n", "ovs-ofctl", "-O", "OpenFlow13", "dump-flows", "s1"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    raw = res.stdout.strip()
-    flows = []
-    if raw and "OFPST_FLOW" in raw:
-        for line in raw.splitlines():
-            if "OFPST_FLOW" in line:
-                continue
-            prio_m = re.search(r"priority=(\d+)", line)
-            pkts_m = re.search(r"n_packets=(\d+)", line)
-            bytes_m = re.search(r"n_bytes=(\d+)", line)
-            dur_m = re.search(r"duration=([\d.]+)s", line)
-            hard_m = re.search(r"hard_timeout=(\d+)", line)
-            act_m = re.search(r"actions=([^\s]+)", line)
-            flows.append({
-                "priority": int(prio_m.group(1)) if prio_m else 0,
-                "packets": int(pkts_m.group(1)) if pkts_m else 0,
-                "bytes": int(bytes_m.group(1)) if bytes_m else 0,
-                "duration_s": float(dur_m.group(1)) if dur_m else 0.0,
-                "hard_timeout": int(hard_m.group(1)) if hard_m else 0,
-                "actions": act_m.group(1) if act_m else "UNKNOWN",
-                "raw": line.strip(),
-            })
-        flows.sort(key=lambda x: x["priority"], reverse=True)
-    return {"switch_active": bool(flows), "flows": flows}
+
+PID_FILE = "/tmp/dynamic-firewall-mininet-pids.json"
+SAFE_SCAN_PORTS = [21, 22, 80, 443, 5555, 8081, 9000, 12345, 23456, 34567]
+FORBIDDEN_PORTS = [4444, 23, 6667]
 
 
 def read_security_logs():
@@ -75,112 +48,253 @@ def read_security_logs():
                         try:
                             events.append(json.loads(line))
                         except Exception:
-                            pass
-        except Exception:
+                            continue
+        except OSError:
             pass
-    return list(reversed(events[-50:]))
+    return list(reversed(events[-100:]))
 
 
 def read_json_file(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError):
+        return default
 
 
-def trigger_simulation(scenario: str):
-    """Triggers a live traffic test via Mininet or directly exercises the TCP/Logger stack."""
+def write_policy(mutator):
     policy = read_json_file(POLICY_PATH, {})
-    drop_timeout = int(policy.get("drop_hard_timeout_sec", 30))
+    mutator(policy)
+    tmp = POLICY_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(policy, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, POLICY_PATH)
+    return policy
+
+
+def get_host_pids():
+    data = read_json_file(PID_FILE, {})
+    live = {}
+    for key, value in data.items():
+        try:
+            pid = int(value)
+            if pid > 0 and os.path.isdir(f"/proc/{pid}"):
+                live[str(key)] = pid
+        except (TypeError, ValueError):
+            continue
+    return live
+
+
+def run_in_host(host, args, timeout=12):
+    """Run a command in an existing Mininet host namespace, returning real output."""
+    pids = get_host_pids()
+    pid = pids.get(host)
+    if not pid:
+        return {"ok": False, "returncode": 1, "stdout": "", "stderr":
+                f"Mininet host {host} is not registered. Restart Mininet using the updated mininet/topology.py."}
+    cmd = ["sudo", "-n", "mnexec", "-a", str(pid)] + list(args)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        return {"ok": result.returncode == 0, "returncode": result.returncode,
+                "stdout": result.stdout.strip(), "stderr": result.stderr.strip(),
+                "command": " ".join(cmd)}
+    except subprocess.TimeoutExpired as exc:
+        return {"ok": False, "returncode": 124, "stdout": (exc.stdout or "").strip() if isinstance(exc.stdout, str) else "",
+                "stderr": f"Command exceeded {timeout}s", "command": " ".join(cmd)}
+    except OSError as exc:
+        return {"ok": False, "returncode": 1, "stdout": "", "stderr": str(exc), "command": " ".join(cmd)}
+
+
+def get_ovs_flows():
+    """Return actual switch connectivity, flow rows and command errors."""
+    try:
+        bridge = subprocess.run(["sudo", "-n", "ovs-vsctl", "br-exists", "s1"],
+                                capture_output=True, text=True, timeout=3)
+        if bridge.returncode != 0:
+            return {"switch_active": False, "flows": [], "error": bridge.stderr.strip() or "Bridge s1 not found"}
+        res = subprocess.run(["sudo", "-n", "ovs-ofctl", "-O", "OpenFlow13", "dump-flows", "s1"],
+                             capture_output=True, text=True, timeout=4)
+        if res.returncode != 0:
+            return {"switch_active": True, "flows": [], "error": res.stderr.strip() or "ovs-ofctl failed"}
+        raw = res.stdout.strip()
+        flows = []
+        for line in raw.splitlines():
+            if not line.strip() or "OFPST_FLOW" in line:
+                continue
+            def m(pattern):
+                return re.search(pattern, line)
+            prio, pkts, byt = m(r"priority=(\d+)"), m(r"n_packets=(\d+)"), m(r"n_bytes=(\d+)")
+            dur, hard, idle = m(r"duration=([\d.]+)s"), m(r"hard_timeout=(\d+)"), m(r"idle_timeout=(\d+)")
+            act = m(r"actions=(.*)$")
+            flows.append({
+                "priority": int(prio.group(1)) if prio else 0,
+                "packets": int(pkts.group(1)) if pkts else 0,
+                "bytes": int(byt.group(1)) if byt else 0,
+                "duration_s": float(dur.group(1)) if dur else 0.0,
+                "hard_timeout": int(hard.group(1)) if hard else 0,
+                "idle_timeout": int(idle.group(1)) if idle else 0,
+                "actions": act.group(1).strip() if act else "UNKNOWN",
+                "raw": line.strip(),
+            })
+        return {"switch_active": True, "flows": sorted(flows, key=lambda x: x["priority"], reverse=True), "error": ""}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"switch_active": False, "flows": [], "error": str(exc)}
+
+
+def get_controller_status():
+    try:
+        with socket.create_connection(("127.0.0.1", 6653), timeout=0.7):
+            return {"reachable": True, "host": "127.0.0.1", "port": 6653, "error": ""}
+    except OSError as exc:
+        return {"reachable": False, "host": "127.0.0.1", "port": 6653, "error": str(exc)}
+
+
+def get_logger_status():
+    try:
+        with socket.create_connection(("10.0.0.4", 9999), timeout=1.2):
+            return {"reachable": True, "host": "10.0.0.4", "port": 9999, "error": ""}
+    except OSError as exc:
+        return {"reachable": False, "host": "10.0.0.4", "port": 9999, "error": str(exc)}
+
+
+def send_logger_test():
+    event = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "event_type": "DASHBOARD_LOGGER_CONNECTIVITY_TEST",
+        "action": "LOGGER_TEST",
+        "src_ip": "10.0.0.1", "src_port": 0,
+        "dst_ip": "10.0.0.4", "dst_port": 9999,
+        "protocol": "TCP",
+        "reason": "Dashboard-generated logger connectivity test",
+        "timeout_sec": 0,
+    }
+    try:
+        with socket.create_connection(("10.0.0.4", 9999), timeout=2.0) as sock:
+            sock.settimeout(2.0)
+            sock.sendall((json.dumps(event) + "\n").encode())
+            response = sock.recv(1024).decode("utf-8", "replace").strip()
+        ack = json.loads(response) if response else {}
+        if ack.get("status") == "ACK":
+            return {"ok": True, "detail": f"Logger acknowledged event #{ack.get('event_id')}"}
+        return {"ok": False, "detail": f"Logger returned: {response or 'no acknowledgement'}"}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "detail": f"Logger test failed: {exc}"}
+
+
+def configure_test_timeout(value):
+    if value not in (-1, 0, 30, 60, 120):
+        raise ValueError("Timeout must be policy default, 0, 30, 60 or 120 seconds")
+    def mutate(pol):
+        pol["dashboard_test_timeout_sec"] = None if value == -1 else value
+    return write_policy(mutate)
+
+
+def trigger_simulation(scenario: str, options=None):
+    """Execute real Mininet-host traffic. Results are based on captured command output."""
+    options = options or {}
+    host = str(options.get("host", "h1"))
+    if host not in ("h1", "h2"):
+        return {"status": "ERROR", "title": "Invalid source host", "detail": "Choose h1 or h2."}
+
+    try:
+        attempts = max(1, min(100, int(options.get("attempts", 1))))
+    except (TypeError, ValueError):
+        attempts = 1
+    policy = read_json_file(POLICY_PATH, {})
+    client = os.path.join(BASE_DIR, "socket_app", "tcp_client.py")
+
+    if scenario == "clear_logs":
+        # Clear telemetry only; do not erase controller-owned dynamic state or switch rules.
+        try:
+            open(LOG_PATH, "w", encoding="utf-8").close()
+            return {"status": "INFO", "title": "Security event log cleared", "detail": "Only the persisted log file was cleared. Active firewall rules and IPS state were left unchanged."}
+        except OSError as exc:
+            return {"status": "ERROR", "title": "Could not clear logs", "detail": str(exc)}
+
+    if scenario == "controller_test":
+        result = get_controller_status()
+        return {"status": "ALLOW" if result["reachable"] else "ERROR",
+                "title": "Controller reachable" if result["reachable"] else "Controller unavailable",
+                "detail": f"{result['host']}:{result['port']} — " + (result["error"] or "TCP connection successful")}
+
+    if scenario == "logger_test":
+        result = send_logger_test()
+        return {"status": "ALLOW" if result["ok"] else "ERROR",
+                "title": "Logger reachable" if result["ok"] else "Logger test failed",
+                "detail": result["detail"]}
 
     if scenario == "normal_h1_8080":
-        return {
-            "status": "ALLOW",
-            "title": "Authorized TCP Flow Permitted",
-            "detail": "h1 (10.0.0.1) -> h3 (10.0.0.3:8080) | Priority 10 Flow Installed | [ACK] Received (1.8ms)",
-        }
+        result = run_in_host(host, ["python3", client, "--server-ip", "10.0.0.3",
+                                    "--port", "8080", "--messages", str(attempts)], timeout=max(12, attempts * 4))
+        out = result["stdout"] or result["stderr"]
+        allowed = result["ok"] and "[ACK]" in out
+        return {"status": "ALLOW" if allowed else ("BLOCK" if "[FIREWALL BLOCK]" in out else "ERROR"),
+                "title": f"{host} TCP test: {'success' if allowed else 'not successful'}",
+                "detail": out or result["stderr"] or "No output from Mininet command.",
+                "command_ok": result["ok"]}
 
-    elif scenario == "attack_h1_4444":
-        event = {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "event_type": "SDN_FIREWALL_RULE",
-            "src_ip": "10.0.0.1",
-            "src_port": 51492,
-            "dst_ip": "10.0.0.3",
-            "dst_port": 4444,
-            "protocol": "TCP",
-            "action": "DROP_FLOW_INSTALLED",
-            "reason": "Forbidden TCP destination port 4444 blocked (10.0.0.1 -> 10.0.0.3:4444)",
-            "timeout_sec": drop_timeout,
-        }
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event) + "\n")
-        subprocess.run(
-            [
-                "sudo", "-n", "ovs-ofctl", "-O", "OpenFlow13", "add-flow", "s1",
-                f"priority=100,hard_timeout={drop_timeout},tcp,nw_src=10.0.0.1,nw_dst=10.0.0.3,tp_dst=4444,actions=drop"
-            ],
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        return {
-            "status": "BLOCK",
-            "title": "DROP_FLOW_INSTALLED (Port 4444)",
-            "detail": f"OpenFlow priority=100 DROP rule pushed to s1 (hard_timeout={drop_timeout}s) & logged to h4:9999",
-        }
+    if scenario == "attack_h2_8080":
+        result = run_in_host("h2", ["python3", client, "--server-ip", "10.0.0.3",
+                                    "--port", "8080", "--messages", str(attempts)], timeout=max(12, attempts * 4))
+        out = result["stdout"] or result["stderr"]
+        blocked = "[FIREWALL BLOCK]" in out or "timed out" in out.lower()
+        return {"status": "BLOCK" if blocked else "ERROR",
+                "title": "Static blacklist test",
+                "detail": out or result["stderr"] or "No output from Mininet command.",
+                "command_ok": result["ok"]}
 
-    elif scenario == "attack_h2_8080":
-        event = {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "event_type": "SDN_FIREWALL_RULE",
-            "src_ip": "10.0.0.2",
-            "src_port": 48210,
-            "dst_ip": "10.0.0.3",
-            "dst_port": 8080,
-            "protocol": "TCP",
-            "action": "HOST_BLOCKED",
-            "reason": "Blacklisted source host 10.0.0.2 blocked from accessing 10.0.0.3",
-            "timeout_sec": drop_timeout,
-        }
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event) + "\n")
-        subprocess.run(
-            [
-                "sudo", "-n", "ovs-ofctl", "-O", "OpenFlow13", "add-flow", "s1",
-                f"priority=100,hard_timeout={drop_timeout},ip,nw_src=10.0.0.2,nw_dst=10.0.0.3,actions=drop"
-            ],
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        return {
-            "status": "BLOCK",
-            "title": "HOST_BLOCKED (10.0.0.2 Quarantined)",
-            "detail": f"Blacklisted source 10.0.0.2 dropped at switch s1 (priority=100, hard_timeout={drop_timeout}s)",
-        }
+    if scenario in ("strike1", "strike2", "forbidden_attempts"):
+        ports = FORBIDDEN_PORTS
+        if scenario == "strike1":
+            ports = [4444]
+        elif scenario == "strike2":
+            ports = [23]
+        results = []
+        # Each strike uses a distinct forbidden destination port so the switch's
+        # first per-port DROP rule cannot hide the next strike from the controller.
+        for i in range(min(attempts, len(ports))):
+            port = ports[i]
+            r = run_in_host("h1", ["python3", client, "--server-ip", "10.0.0.3", "--port", str(port)], timeout=6)
+            results.append(f"Port {port}:\n{r['stdout'] or r['stderr'] or 'No command output'}")
+            if not r.get("ok") and "Connection timed out" not in (r.get("stdout", "") + r.get("stderr", "")):
+                break
+        return {"status": "INFO", "title": "Forbidden-port strike attempts sent",
+                "detail": "\n\n".join(results) + "\n\nCheck controller output and the quarantine countdown for the authoritative strike/quarantine result."}
 
-    elif scenario == "clear_logs":
-        if os.path.exists(LOG_PATH):
-            os.remove(LOG_PATH)
-        subprocess.run(
-            ["sudo", "-n", "ovs-ofctl", "-O", "OpenFlow13", "del-flows", "s1", "tcp,tp_dst=4444"],
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        subprocess.run(
-            ["sudo", "-n", "ovs-ofctl", "-O", "OpenFlow13", "del-flows", "s1", "ip,nw_src=10.0.0.2"],
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        return {
-            "status": "INFO",
-            "title": "Telemetry & Ephemeral Drop Rules Cleared",
-            "detail": "Reset security_events.log and cleared priority=100 drop flows on s1",
-        }
+    if scenario == "port_scan":
+        count = max(2, min(attempts, len(SAFE_SCAN_PORTS)))
+        ports = SAFE_SCAN_PORTS[:count]
+        code = ("import socket; ports=" + repr(ports) +
+                "; exec(\"for p in ports:\\n s=socket.socket(); s.settimeout(0.5); "
+                "r=s.connect_ex(('10.0.0.3',p)); print('Port',p,'result',r,flush=True); s.close()\")")
+        result = run_in_host("h1", ["python3", "-c", code], timeout=12)
+        out = result["stdout"] or result["stderr"]
+        return {"status": "INFO" if result["ok"] else "ERROR",
+                "title": f"Port scan: {len(ports)} distinct ports probed",
+                "detail": out or result["stderr"] or "No output.", "command_ok": result["ok"]}
 
-    return {"status": "INFO", "title": "Unknown action", "detail": ""}
+    if scenario == "tcp_flood":
+        interval = float(options.get("interval", 0.05))
+        interval = max(0.0, min(1.0, interval))
+        result = run_in_host("h1", ["python3", client, "--server-ip", "10.0.0.3",
+                                    "--port", "8080", "--mode", "flood",
+                                    "--count", str(attempts), "--interval", str(interval)],
+                             timeout=max(15, int(attempts * interval + 8)))
+        out = result["stdout"] or result["stderr"]
+        return {"status": "INFO" if result["ok"] else "ERROR",
+                "title": f"TCP flood test: {attempts} connection attempts",
+                "detail": out or result["stderr"] or "No output.", "command_ok": result["ok"]}
+
+    if scenario == "access_test":
+        result = run_in_host("h1", ["python3", client, "--server-ip", "10.0.0.3",
+                                    "--port", "8080"], timeout=7)
+        out = result["stdout"] or result["stderr"]
+        status = "ALLOW" if "[ACK]" in out else ("BLOCK" if "timed out" in out.lower() else "ERROR")
+        return {"status": status, "title": "Access/recovery test", "detail": out or result["stderr"] or "No output."}
+
+    return {"status": "ERROR", "title": "Unknown test", "detail": scenario}
 
 
 HTML_PAGE = r"""<!DOCTYPE html>
@@ -746,8 +860,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span class="brand-sub">OpenFlow 1.3 Control Plane &amp; TCP SOC Telemetry</span>
   </div>
   <div class="topbar-right">
-    <span class="pill tabular" id="controller-pill">Controller: 127.0.0.1:6653</span>
-    <span class="pill tabular" id="logger-pill">SOC Logger: 10.0.0.4:9999</span>
+    <span class="pill tabular" id="controller-pill">Controller: checking...</span>
+    <span class="pill tabular" id="logger-pill">SOC Logger: checking...</span>
     <button class="btn" onclick="triggerSim('clear_logs')">Reset Logs <span class="kbd">R</span></button>
   </div>
 </header>
@@ -761,19 +875,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="kpi-sub">Persisted in <code class="tabular">security_events.log</code></div>
     </div>
     <div class="card">
-      <div class="kpi-label"><span>Mean Blocking Response</span><span class="tabular">D2 Metric</span></div>
+      <div class="kpi-label"><span>Mean Blocking Response (Saved Benchmark)</span><span class="tabular">D2 Metric</span></div>
       <div class="kpi-value tabular" id="kpi-response">33.09 ms</div>
       <div class="kpi-sub">PacketIn &rarr; OVS <code class="tabular">priority=100</code> Drop</div>
     </div>
     <div class="card">
-      <div class="kpi-label"><span>Control-Plane Offload</span><span class="tabular">OVS Hardware</span></div>
+      <div class="kpi-label"><span>Control-Plane Offload (Benchmark)</span><span class="tabular">OVS Hardware</span></div>
       <div class="kpi-value tabular" id="kpi-offload">96.2%</div>
       <div class="kpi-sub"><span class="tabular">3</span> vs <span class="tabular">80</span> PacketIn events under flood</div>
     </div>
     <div class="card">
       <div class="kpi-label"><span>Dynamic Drop Timeout</span><span class="tabular">Self-Healing</span></div>
-      <div class="kpi-value tabular" id="kpi-timeout">30s</div>
-      <div class="kpi-sub">Automatic <code class="tabular">hard_timeout</code> expiration</div>
+      <div class="kpi-value tabular" id="kpi-timeout">30s / 60s / 120s</div>
+      <div class="kpi-sub">Port scan: 30s · TCP flood: 60s · Repeat attack: 120s</div>
     </div>
   </section>
 
@@ -845,6 +959,55 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </section>
 
+
+  <!-- Real Mininet test controls -->
+  <section class="card" id="test-console">
+    <div class="section-header">
+      <div>
+        <div class="section-title">Live Attack & Recovery Test Console</div>
+        <div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">Actions execute inside real Mininet host namespaces. Results below come from captured command output.</div>
+      </div>
+      <span class="pill tabular" id="mininet-status">Mininet: checking...</span>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:end;">
+      <label style="font-size:12px;color:var(--text-secondary);">Access attempts<br>
+        <input class="input-inline" id="test-attempts" type="number" min="1" max="100" value="5">
+      </label>
+      <label style="font-size:12px;color:var(--text-secondary);">Test block timeout<br>
+        <select class="input-inline" id="test-timeout">
+          <option value="-1" selected>Use policy defaults (30/60/120)</option>
+          <option value="0">No block (detect/log only)</option>
+          <option value="30">30 seconds</option>
+          <option value="60">60 seconds</option>
+          <option value="120">120 seconds</option>
+        </select>
+      </label>
+      <button class="btn" onclick="applyTestConfig()">Apply test settings</button>
+      <span class="pill" id="test-config-status">Timeout override: 30s</span>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:9px;margin-top:16px;">
+      <button class="btn btn-allow" onclick="runTest('normal_h1_8080')">Normal TCP (h1)</button>
+      <button class="btn btn-danger" onclick="runTest('attack_h2_8080')">Static blacklist (h2)</button>
+      <button class="btn btn-danger" onclick="runTest('strike1')">Forbidden strike 1 (h1:4444)</button>
+      <button class="btn btn-danger" onclick="runTest('strike2')">Forbidden strike 2 (h1:23)</button>
+      <button class="btn btn-danger" onclick="runTest('forbidden_attempts')">Run N distinct forbidden strikes</button>
+      <button class="btn btn-danger" onclick="runTest('port_scan')">Port scan (N distinct ports)</button>
+      <button class="btn btn-danger" onclick="runTest('tcp_flood')">TCP flood (N connections)</button>
+      <span style="font-size:11px;color:var(--text-muted);align-self:center;">Current flood threshold: 20 SYNs / 5s. Set attempts to 20+ to trigger it.</span>
+      <button class="btn" onclick="runTest('access_test')">Test h1 access / recovery</button>
+      <button class="btn" onclick="runTest('controller_test')">Test controller connection</button>
+      <button class="btn" onclick="runTest('logger_test')">Test logger connection</button>
+      <button class="btn" onclick="fetchState()">Refresh live status / flows</button>
+    </div>
+    <div style="margin-top:14px;">
+      <div class="section-header" style="margin-bottom:7px;">
+        <div class="section-title">Live test output</div>
+        <span class="pill" id="test-result-status">Ready</span>
+      </div>
+      <pre id="test-output" style="white-space:pre-wrap;overflow-wrap:anywhere;background:#090a0f;border-radius:8px;padding:12px;min-height:66px;color:#cbd5e1;font:12px/1.55 var(--font-mono);">Choose a test above. Mininet must be running.</pre>
+    </div>
+  </section>
+
   <!-- Bottom Grid: Hot-Reloading Policy Editor + OpenFlow Table & D2 Benchmarks -->
   <section class="main-grid">
     <!-- Left: Live OpenFlow 1.3 Flow Table -->
@@ -875,7 +1038,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div>
         <div class="section-header" style="margin-bottom:8px;">
           <div class="section-title">Dynamic Policy Control (<code class="tabular">controller/policy.json</code>)</div>
-          <span class="pill" style="color:var(--accent-emerald)">Zero-Downtime Hot-Reload</span>
+          <span class="pill" style="color:var(--accent-emerald)">Policy file editor (controller polls policy)</span>
         </div>
 
         <div style="font-size:12px;color:var(--text-secondary);margin-top:6px;">Blocked Host IPs</div>
@@ -967,6 +1130,43 @@ HTML_PAGE = r"""<!DOCTYPE html>
     fetchState();
   }
 
+
+  async function applyTestConfig() {
+    const timeout = Number(document.getElementById("test-timeout").value);
+    const res = await fetch("/api/test-config", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({timeout_sec: timeout})
+    });
+    const data = await res.json();
+    document.getElementById("test-config-status").textContent =
+      data.ok ? (timeout === -1 ? "Timeout override: policy defaults" : `Timeout override: ${timeout}s`) : (data.error || "Configuration failed");
+    showToast(data.ok ? "Test settings applied" : "Test settings failed",
+      data.detail || data.error || "", data.ok ? "INFO" : "BLOCK");
+    fetchState();
+  }
+
+  async function runTest(scenario) {
+    const attempts = Math.max(1, Math.min(100, Number(document.getElementById("test-attempts").value || 1)));
+    const output = document.getElementById("test-output");
+    const badge = document.getElementById("test-result-status");
+    output.textContent = "Running real Mininet test... please wait.";
+    badge.textContent = "Running";
+    try {
+      const res = await fetch("/api/simulate", {
+        method: "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({scenario, attempts})
+      });
+      const data = await res.json();
+      output.textContent = `${data.title || "Test"}\n\n${data.detail || data.error || ""}`;
+      badge.textContent = data.status || (res.ok ? "Complete" : "Error");
+      showToast(data.title || "Test complete", data.status || "", data.status || "INFO");
+      fetchState();
+    } catch (e) {
+      output.textContent = `Dashboard request failed: ${e}`;
+      badge.textContent = "ERROR";
+    }
+  }
+
   async function updatePolicy(newPol) {
     await fetch("/api/policy", {
       method: "POST",
@@ -1014,8 +1214,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
       // KPI updates
       document.getElementById("kpi-alerts").textContent = state.logs.length;
       document.getElementById("feed-count-pill").textContent = `${state.logs.length} ${state.logs.length === 1 ? "Event" : "Events"}`;
-      document.getElementById("kpi-timeout").textContent = `${state.policy.drop_hard_timeout_sec || 30}s`;
-
+      document.getElementById("kpi-timeout").textContent = "30s / 60s / 120s";
+      const cp = document.getElementById("controller-pill");
+      cp.textContent = state.controller.reachable ? "Controller: ONLINE (127.0.0.1:6653)" : "Controller: OFFLINE";
+      cp.style.color = state.controller.reachable ? "#34d399" : "#f87171";
+      const lp = document.getElementById("logger-pill");
+      lp.textContent = state.logger.reachable ? "SOC Logger: ONLINE (10.0.0.4:9999)" : "SOC Logger: OFFLINE";
+      lp.style.color = state.logger.reachable ? "#34d399" : "#f87171";
+      document.getElementById("mininet-status").textContent = state.mininet.ready ? "Mininet: READY" : "Mininet: NOT READY";
+      document.getElementById("mininet-status").style.color = state.mininet.ready ? "#34d399" : "#f87171";
+      const testTimeout = state.policy.dashboard_test_timeout_sec;
+      document.getElementById("test-config-status").textContent = testTimeout === null
+        ? "Timeout override: policy defaults" : `Timeout override: ${testTimeout}s`;
+      const timeoutSelect = document.getElementById("test-timeout");
+      if (timeoutSelect && document.activeElement !== timeoutSelect) timeoutSelect.value = testTimeout === null ? "-1" : String(testTimeout);
+      const active = state.dynamic_blocks || [];
+      const h1Badge = document.querySelector("#node-h1 .node-title span:last-child");
+      const h2Badge = document.querySelector("#node-h2 .node-title span:last-child");
+      const h1Ban = active.find(x => x.ip === "10.0.0.1");
+      if (h1Badge) { h1Badge.textContent = h1Ban ? `BLOCKED ${h1Ban.remaining_sec}s` : "AUTH"; h1Badge.style.color = h1Ban ? "#f87171" : "#34d399"; }
+      if (h2Badge) { h2Badge.textContent = (state.policy.blocked_hosts || []).includes("10.0.0.2") ? "BLACKLIST" : "AUTH"; h2Badge.style.color = (state.policy.blocked_hosts || []).includes("10.0.0.2") ? "#f87171" : "#34d399"; }
       if (state.benchmark && state.benchmark.blocking_response_time_ms) {
         document.getElementById("kpi-response").textContent = `${state.benchmark.blocking_response_time_ms.mean_ms} ms`;
       }
@@ -1052,7 +1270,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById("s1-flow-count").textContent = `Active Flows: ${flows.length}`;
       const tbody = document.getElementById("flow-table-body");
       if (flows.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="6" style="color:var(--text-muted);">Switch s1 offline or no flows installed (start Mininet or click a simulation button above)</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="6" style="color:var(--text-muted);">${state.ovs.error ? "OpenFlow query error: " + state.ovs.error : (state.ovs.switch_active ? "Switch connected; no flow entries returned." : "Switch s1 is not available. Start Mininet and verify sudo permissions.")}</td></tr>`;
       } else {
         tbody.innerHTML = flows.slice(0, 8).map(f => {
           const isDrop = f.actions.toLowerCase().includes("drop");
@@ -1069,7 +1287,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           `;
         }).join("");
       }
-    } catch (e) {}
+    } catch (e) {
+      document.getElementById("mininet-status").textContent = "Dashboard state error";
+      document.getElementById("test-output").textContent = String(e);
+    }
   }
 
   // Emil Kowalski Rule: Keyboard shortcuts execute immediately with zero lag
@@ -1124,6 +1345,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "logs": logs,
                 "benchmark": bench,
                 "ovs": ovs,
+                "logger": get_logger_status(),
+                "controller": get_controller_status(),
+                "mininet": {"ready": bool(get_host_pids()) and all(k in get_host_pids() for k in ("h1", "h2", "h3", "h4"))},
+                "dynamic_blocks": [
+                    {"ip": ip, "kind": "quarantine", "remaining_sec": max(0, int(exp - time.time()))}
+                    for ip, exp in policy.get("dynamic_block_expiry", {}).items()
+                    if isinstance(exp, (int, float)) and exp > time.time()
+                ],
             })
         else:
             self.send_error(404)
@@ -1134,8 +1363,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         body = json.loads(raw)
 
         if self.path == "/api/simulate":
-            result = trigger_simulation(body.get("scenario", ""))
-            self._send_json(result)
+            result = trigger_simulation(body.get("scenario", ""), body)
+            self._send_json(result, 200 if result.get("status") != "ERROR" else 503)
+        elif self.path == "/api/test-config":
+            try:
+                timeout = int(body.get("timeout_sec", 30))
+                configure_test_timeout(timeout)
+                self._send_json({"ok": True, "detail": f"Controller test timeout override set to {timeout}s."})
+            except (ValueError, OSError) as exc:
+                self._send_json({"ok": False, "error": str(exc)}, 400)
         elif self.path == "/api/policy":
             pol = read_json_file(POLICY_PATH, {})
             pol["blocked_hosts"] = body.get("blocked_hosts", pol.get("blocked_hosts", []))
@@ -1152,7 +1388,7 @@ if __name__ == "__main__":
     print(f"\n======================================================================")
     print(f" [SDN SOC UI ACTIVE] Open http://{host}:{port} in Firefox")
     print(f"======================================================================\n", flush=True)
-    server = HTTPServer((host, port), DashboardHandler)
+    server = ThreadingHTTPServer((host, port), DashboardHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
