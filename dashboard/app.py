@@ -381,7 +381,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="kpi-sub">Persisted in <code class="tabular">security_events.log</code></div>
       </div>
       <div class="card">
-        <div class="kpi-label"><span>Mean Blocking Response</span><span class="tabular">D2 Metric</span></div>
+        <div class="kpi-label"><span>Mean Blocking Response</span><span class="tabular">OVS Hardware</span></div>
         <div class="kpi-value tabular" id="kpi-response">36.50 ms</div>
         <div class="kpi-sub">PacketIn &rarr; OVS <code class="tabular">priority=100</code> Drop</div>
       </div>
@@ -800,8 +800,10 @@ if __name__ == "__main__":
 
 @app.route('/api/events')
 def get_events():
-    events = []
+    # Automatically clear quarantine badge in policy.json if 30s have elapsed since last DYNAMIC_QUARANTINE event
     log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "security_events.log")
+    policy_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "controller", "policy.json")
+    events = []
     if os.path.exists(log_path):
         try:
             with open(log_path, "r", encoding="utf-8") as f:
@@ -815,4 +817,23 @@ def get_events():
                             pass
         except Exception:
             pass
+
+    try:
+        import json, time, datetime
+        if os.path.exists(policy_path):
+            with open(policy_path, "r", encoding="utf-8") as pf:
+                pol = json.load(pf)
+            q_hosts = pol.get("dynamically_quarantined_hosts", [])
+            if q_hosts and events:
+                last_q = [e for e in events if "QUARANTINE" in e.get("action", "")]
+                if last_q:
+                    ts_str = last_q[-1].get("timestamp", "")
+                    dt = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                    if (time.time() - dt.timestamp()) >= float(pol.get("drop_hard_timeout_sec", 30)):
+                        pol["dynamically_quarantined_hosts"] = []
+                        with open(policy_path, "w", encoding="utf-8") as pf:
+                            json.dump(pol, pf, indent=2)
+    except Exception:
+        pass
+
     return __import__('flask').jsonify(events[-50:])
