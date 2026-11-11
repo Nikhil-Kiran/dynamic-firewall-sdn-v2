@@ -623,7 +623,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         mnPill.textContent = "Mininet Namespaces: LIVE";
         mnPill.style.color = "#34d399";
       } else {
-        mnPill.textContent = "Mininet Namespaces: LIVE";
+        mnPill.textContent = "Mininet: Standby";
         mnPill.style.color = "#f59e0b";
       }
 
