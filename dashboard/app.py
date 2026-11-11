@@ -688,7 +688,38 @@ HTML_PAGE = r"""<!DOCTYPE html>
   fetchState();
   setInterval(fetchState, 1000);
 </script>
+
+<script>
+async function fetchEvents() {
+    try {
+        let res = await fetch('/api/events');
+        let data = await res.json();
+        let container = document.querySelector('.soc-event-stream') || document.getElementById('soc-stream');
+        if (!container) {
+            // Find panel by heading text
+            let headings = Array.from(document.querySelectorAll('h3, h4, div')).filter(el => el.textContent.includes('Centralized SOC Security Event Stream'));
+            if (headings.length > 0) {
+                container = headings[0].parentElement.querySelector('div:not(:first-child)') || headings[0].parentElement;
+            }
+        }
+        if (container && data.length > 0) {
+            document.querySelector('[id*="Events"], .events-badge, [class*="events"]').textContent = data.length + " Events";
+            container.innerHTML = data.map(ev => `
+                <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 6px; padding: 10px; margin-bottom: 8px; font-size: 13px; color: #f87171;">
+                    <b>[${ev.timestamp}] ${ev.action}</b><br>
+                    <span>${ev.reason}</span><br>
+                    <small style="color: #94a3b8;">Src: ${ev.src_ip}:${ev.src_port} &rarr; Dst: ${ev.dst_ip}:${ev.dst_port}</small>
+                </div>
+            `).join('');
+        }
+    } catch (e) {
+        console.error("Failed to fetch events:", e);
+    }
+}
+setInterval(fetchEvents, 1000);
+</script>
 </body>
+
 </html>
 """
 
@@ -764,3 +795,24 @@ if __name__ == "__main__":
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+
+
+
+@app.route('/api/events')
+def get_events():
+    events = []
+    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "security_events.log")
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        import json
+                        try:
+                            events.append(json.loads(line))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    return __import__('flask').jsonify(events[-50:])

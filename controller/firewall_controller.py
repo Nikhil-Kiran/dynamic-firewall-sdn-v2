@@ -20,7 +20,7 @@ from os_ken.base import app_manager
 from os_ken.controller import ofp_event
 from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from os_ken.ofproto import ofproto_v1_3
-from os_ken.lib.packet import ethernet, ether_types, ipv4, tcp
+from os_ken.lib.packet import packet, ethernet, ether_types, ipv4, tcp
 
 from log_client import send_security_event
 
@@ -152,17 +152,21 @@ class DynamicFirewallController(app_manager.OSKenApp):
         parser = datapath.ofproto_parser
         in_port = msg.match["in_port"]
 
-        pkt = ethernet.ethernet(msg.data)
-        if pkt.ethertype in (ether_types.ETH_TYPE_LLDP, ether_types.ETH_TYPE_IPV6):
+        pkt = packet.Packet(msg.data)
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
+        if eth_pkt and eth_pkt.ethertype in (ether_types.ETH_TYPE_LLDP, ether_types.ETH_TYPE_IPV6):
             return
 
         dpid = datapath.id
-        self.mac_to_port.setdefault(dpid, {})
-        self.mac_to_port[dpid][pkt.src] = in_port
-        out_port = self.mac_to_port[dpid].get(pkt.dst, ofproto.OFPP_FLOOD)
+        if eth_pkt:
+            self.mac_to_port.setdefault(dpid, {})
+            self.mac_to_port[dpid][eth_pkt.src] = in_port
+            out_port = self.mac_to_port[dpid].get(eth_pkt.dst, ofproto.OFPP_FLOOD)
+        else:
+            out_port = ofproto.OFPP_FLOOD
 
         # Always forward ARP so hosts can resolve MAC addresses
-        if pkt.ethertype == ether_types.ETH_TYPE_ARP:
+        if eth_pkt and eth_pkt.ethertype == ether_types.ETH_TYPE_ARP:
             actions = [parser.OFPActionOutput(out_port)]
             out = parser.OFPPacketOut(
                 datapath=datapath,
