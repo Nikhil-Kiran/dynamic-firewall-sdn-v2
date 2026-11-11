@@ -1,37 +1,35 @@
 {
-  "firewall_name": "SDN-Dynamic-OpenFlow13-IPS-Firewall",
-  "default_action": "ALLOW",
-  "drop_hard_timeout_sec": 30,
-  "allow_idle_timeout_sec": 60,
-  "dynamic_ips_settings": {
-    "auto_quarantine_on_forbidden_port": true,
-    "max_violations_before_host_ban": 2,
-    "max_tcp_syn_rate_per_10s": 8,
-    "quarantine_duration_sec": 30
-  },
-  "logger_server": {
-    "ip": "10.0.0.4",
-    "port": 9999
-  },
-  "blocked_hosts": [
-    "10.0.0.2"
-  ],
-  "blocked_tcp_ports": [
-    23
-  ],
   "allowed_tcp_ports": [
     8080,
     9999
   ],
+  "allowed_ports": [
+    8080,
+    9999
+  ],
+  "forbidden_tcp_ports": [
+    23,
+    4444
+  ],
+  "blocked_ports": [
+    23,
+    4444
+  ],
+  "blocked_hosts": [
+    "10.0.0.2"
+  ],
   "dynamically_quarantined_hosts": [],
-  "port_scan_threshold": 5,
-  "scan_window_sec": 10,
-  "flood_threshold": 20,
-  "flood_window_sec": 5,
-  "port_scan_block_sec": 30,
-  "tcp_flood_block_sec": 60,
-  "repeat_attack_block_sec": 120,
-  "repeat_attack_window_sec": 300,
-  "repeat_attack_threshold": 2,
-  "dashboard_test_timeout_sec": null
+  "max_port_violations_before_quarantine": 2,
+  "port_scan_threshold": 2,
+  "syn_flood_threshold": 25,
+  "rate_limit_threshold": 25,
+  "syn_flood_window_sec": 3.0,
+  "rate_limit_window_sec": 3.0,
+  "drop_hard_timeout_sec": 30,
+  "port_scan_timeout": 30,
+  "flood_timeout": 60,
+  "repeat_offender_timeout": 120,
+  "allow_idle_timeout_sec": 60,
+  "logger_ip": "10.0.0.4",
+  "logger_port": 9999
 }
