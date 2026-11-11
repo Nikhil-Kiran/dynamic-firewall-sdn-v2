@@ -151,36 +151,85 @@ def get_controller_status():
         return {"reachable": False, "host": "127.0.0.1", "port": 6653, "error": str(exc)}
 
 
+
 def get_logger_status():
-    try:
-        with socket.create_connection(("10.0.0.4", 9999), timeout=1.2):
-            return {"reachable": True, "host": "10.0.0.4", "port": 9999, "error": ""}
-    except OSError as exc:
-        return {"reachable": False, "host": "10.0.0.4", "port": 9999, "error": str(exc)}
+    """Check SOC logger connectivity from inside the Mininet network."""
+    probe_code = (
+        "import socket; "
+        "s=socket.create_connection(('10.0.0.4',9999),timeout=3); "
+        "s.close(); print('CONNECTED')"
+    )
+
+    result = run_in_host("h1", ["python3", "-c", probe_code], timeout=5)
+
+    if result["ok"] and "CONNECTED" in result["stdout"]:
+        return {
+            "reachable": True,
+            "host": "10.0.0.4",
+            "port": 9999,
+            "error": ""
+        }
+
+    return {
+        "reachable": False,
+        "host": "10.0.0.4",
+        "port": 9999,
+        "error": result.get("stderr") or result.get("stdout") or "Logger unreachable from Mininet h1"
+    }
 
 
 def send_logger_test():
+    """Send a real test event to h4 through the Mininet network."""
     event = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "event_type": "DASHBOARD_LOGGER_CONNECTIVITY_TEST",
         "action": "LOGGER_TEST",
-        "src_ip": "10.0.0.1", "src_port": 0,
-        "dst_ip": "10.0.0.4", "dst_port": 9999,
+        "src_ip": "10.0.0.1",
+        "src_port": 0,
+        "dst_ip": "10.0.0.4",
+        "dst_port": 9999,
         "protocol": "TCP",
         "reason": "Dashboard-generated logger connectivity test",
         "timeout_sec": 0,
     }
+
+    payload = json.dumps(event)
+    script = (
+        "import socket,json\n"
+        f"payload = {json.dumps(payload)}\n"
+        "with socket.create_connection(('10.0.0.4',9999),timeout=4) as s:\n"
+        " s.settimeout(4)\n"
+        " s.sendall((payload+'\\n').encode())\n"
+        " response=s.makefile('r').readline().strip()\n"
+        " ack=json.loads(response) if response else {}\n"
+        " print(json.dumps(ack))\n"
+    )
+
+    result = run_in_host("h1", ["python3", "-c", script], timeout=7)
+
+    if not result["ok"]:
+        return {
+            "ok": False,
+            "detail": result.get("stderr") or result.get("stdout") or "Could not contact logger from h1"
+        }
+
     try:
-        with socket.create_connection(("10.0.0.4", 9999), timeout=2.0) as sock:
-            sock.settimeout(2.0)
-            sock.sendall((json.dumps(event) + "\n").encode())
-            response = sock.recv(1024).decode("utf-8", "replace").strip()
-        ack = json.loads(response) if response else {}
+        ack = json.loads(result["stdout"].splitlines()[-1])
         if ack.get("status") == "ACK":
-            return {"ok": True, "detail": f"Logger acknowledged event #{ack.get('event_id')}"}
-        return {"ok": False, "detail": f"Logger returned: {response or 'no acknowledgement'}"}
-    except (OSError, ValueError) as exc:
-        return {"ok": False, "detail": f"Logger test failed: {exc}"}
+            return {
+                "ok": True,
+                "detail": f"Logger acknowledged event #{ack.get('event_id')}"
+            }
+
+        return {
+            "ok": False,
+            "detail": f"Logger returned: {ack}"
+        }
+    except (ValueError, IndexError):
+        return {
+            "ok": False,
+            "detail": f"Unexpected logger response: {result['stdout']}"
+        }
 
 
 def configure_test_timeout(value):
@@ -1208,7 +1257,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   async function fetchState() {
     try {
-      const res = await fetch("/api/state");
+      const res = await fetch("/api/state?_=" + Date.now(), {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache" }
+      });
+      if (!res.ok) throw new Error("Dashboard API returned HTTP " + res.status);
       const state = await res.json();
 
       // KPI updates
@@ -1242,7 +1295,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const feed = document.getElementById("soc-feed");
       if (state.logs.length === 0) {
         feed.innerHTML = `<div style="color:var(--text-muted);font-size:13px;padding:24px 0;text-align:center;">No security violations logged yet. Trigger a forbidden port or blacklisted host test.</div>`;
-      } else if (state.logs.length !== lastEventCount) {
+      } else {
         feed.innerHTML = state.logs.map(ev => `
           <div class="alert-item">
             <div>
