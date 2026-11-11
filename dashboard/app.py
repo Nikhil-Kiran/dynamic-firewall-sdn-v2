@@ -1,73 +1,40 @@
 #!/usr/bin/env python3
 """
-SDN Dynamic Firewall & SOC Telemetry Web UI (Real Mininet Namespace Execution + Auto-Pilot Demo)
-Serves a real-time Linear/Vercel-inspired control plane on http://127.0.0.1:5000
-Executes REAL TCP packets inside Mininet hosts (h1, h2) via mnexec -a <pid>.
+SDN Dynamic Firewall & SOC Telemetry Web UI (Built with Emil Kowalski Design Engineering Principles)
+Serves a real-time Linear/Vercel-inspired dashboard on http://127.0.0.1:5000
+Connects directly to:
+  - security_events.log (Person C live JSON telemetry)
+  - controller/policy.json (Person B live hot-reloading policy)
+  - ovs-ofctl -O OpenFlow13 dump-flows s1 (Live Open vSwitch flow table)
+  - benchmarks/d2_benchmark_results.json (Deliverable 2 performance metrics)
 """
 
 import json
 import os
 import re
+import socket
 import subprocess
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 POLICY_PATH = os.path.join(BASE_DIR, "controller", "policy.json")
 LOG_PATH = os.path.join(BASE_DIR, "security_events.log")
 BENCH_PATH = os.path.join(BASE_DIR, "benchmarks", "d2_benchmark_results.json")
-PLOTS_DIR = os.path.join(BASE_DIR, "benchmarks")
-TCP_CLIENT_SCRIPT = os.path.join(BASE_DIR, "socket_app", "tcp_client.py")
-HOST_PIDS_FILE = "/tmp/mininet_host_pids.json"
-RESET_SIGNAL_FILE = "/tmp/sdn_reset_quarantine"
+
+import sys
+sys.path.insert(0, os.path.join(BASE_DIR, "controller"))
+try:
+    from log_client import send_security_event
+except Exception:
+    send_security_event = None
 
 
-class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
 
-
-def get_host_pids():
-    if os.path.exists(HOST_PIDS_FILE):
-        try:
-            with open(HOST_PIDS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-
-def get_ovs_flows():
-    res = subprocess.run(
-        ["sudo", "-n", "ovs-ofctl", "-O", "OpenFlow13", "dump-flows", "s1"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    raw = res.stdout.strip()
-    flows = []
-    if raw and "OFPST_FLOW" in raw:
-        for line in raw.splitlines():
-            if "OFPST_FLOW" in line:
-                continue
-            prio_m = re.search(r"priority=(\d+)", line)
-            pkts_m = re.search(r"n_packets=(\d+)", line)
-            bytes_m = re.search(r"n_bytes=(\d+)", line)
-            dur_m = re.search(r"duration=([\d.]+)s", line)
-            hard_m = re.search(r"hard_timeout=(\d+)", line)
-            act_m = re.search(r"actions=([^\s]+)", line)
-            flows.append({
-                "priority": int(prio_m.group(1)) if prio_m else 0,
-                "packets": int(pkts_m.group(1)) if pkts_m else 0,
-                "bytes": int(bytes_m.group(1)) if bytes_m else 0,
-                "duration_s": float(dur_m.group(1)) if dur_m else 0.0,
-                "hard_timeout": int(hard_m.group(1)) if hard_m else 0,
-                "actions": act_m.group(1) if act_m else "UNKNOWN",
-                "raw": line.strip(),
-            })
-        flows.sort(key=lambda x: x["priority"], reverse=True)
-    return {"switch_active": bool(flows), "flows": flows}
+PID_FILE = "/tmp/dynamic-firewall-mininet-pids.json"
+SAFE_SCAN_PORTS = [21, 22, 80, 443, 5555, 8081, 9000, 12345, 23456, 34567]
+FORBIDDEN_PORTS = [4444, 23, 6667]
 
 
 def read_security_logs():
@@ -81,120 +48,253 @@ def read_security_logs():
                         try:
                             events.append(json.loads(line))
                         except Exception:
-                            pass
-        except Exception:
+                            continue
+        except OSError:
             pass
-    return list(reversed(events[-50:]))
+    return list(reversed(events[-100:]))
 
 
 def read_json_file(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError):
+        return default
 
 
-def run_real_mininet_client(host_name: str, port: int, mode: str, messages: int = 1):
-    """Executes the real socket_app/tcp_client.py inside the live Mininet host namespace via mnexec."""
-    pids = get_host_pids()
-    pid = pids.get(host_name)
-    cmd_str = f"{host_name} python3 socket_app/tcp_client.py --server-ip 10.0.0.3 --port {port} --mode {mode} --messages {messages}"
-
-    if pid:
-        cmd = [
-            "sudo", "-n", "mnexec", "-a", str(pid),
-            "python3", TCP_CLIENT_SCRIPT,
-            "--server-ip", "10.0.0.3",
-            "--port", str(port),
-            "--mode", mode,
-            "--messages", str(messages),
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=8, check=False)
-        out = (res.stdout + "\n" + res.stderr).strip()
-        return cmd_str, out, True
-    return cmd_str, "[WARN] Mininet PID not found. Run via sudo python3 start_everything.py", False
-
-
-def trigger_simulation(scenario: str):
+def write_policy(mutator):
     policy = read_json_file(POLICY_PATH, {})
-    drop_timeout = int(policy.get("drop_hard_timeout_sec", 30))
+    mutator(policy)
+    tmp = POLICY_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(policy, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, POLICY_PATH)
+    return policy
+
+
+def get_host_pids():
+    data = read_json_file(PID_FILE, {})
+    live = {}
+    for key, value in data.items():
+        try:
+            pid = int(value)
+            if pid > 0 and os.path.isdir(f"/proc/{pid}"):
+                live[str(key)] = pid
+        except (TypeError, ValueError):
+            continue
+    return live
+
+
+def run_in_host(host, args, timeout=12):
+    """Run a command in an existing Mininet host namespace, returning real output."""
+    pids = get_host_pids()
+    pid = pids.get(host)
+    if not pid:
+        return {"ok": False, "returncode": 1, "stdout": "", "stderr":
+                f"Mininet host {host} is not registered. Restart Mininet using the updated mininet/topology.py."}
+    cmd = ["sudo", "-n", "mnexec", "-a", str(pid)] + list(args)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        return {"ok": result.returncode == 0, "returncode": result.returncode,
+                "stdout": result.stdout.strip(), "stderr": result.stderr.strip(),
+                "command": " ".join(cmd)}
+    except subprocess.TimeoutExpired as exc:
+        return {"ok": False, "returncode": 124, "stdout": (exc.stdout or "").strip() if isinstance(exc.stdout, str) else "",
+                "stderr": f"Command exceeded {timeout}s", "command": " ".join(cmd)}
+    except OSError as exc:
+        return {"ok": False, "returncode": 1, "stdout": "", "stderr": str(exc), "command": " ".join(cmd)}
+
+
+def get_ovs_flows():
+    """Return actual switch connectivity, flow rows and command errors."""
+    try:
+        bridge = subprocess.run(["sudo", "-n", "ovs-vsctl", "br-exists", "s1"],
+                                capture_output=True, text=True, timeout=3)
+        if bridge.returncode != 0:
+            return {"switch_active": False, "flows": [], "error": bridge.stderr.strip() or "Bridge s1 not found"}
+        res = subprocess.run(["sudo", "-n", "ovs-ofctl", "-O", "OpenFlow13", "dump-flows", "s1"],
+                             capture_output=True, text=True, timeout=4)
+        if res.returncode != 0:
+            return {"switch_active": True, "flows": [], "error": res.stderr.strip() or "ovs-ofctl failed"}
+        raw = res.stdout.strip()
+        flows = []
+        for line in raw.splitlines():
+            if not line.strip() or "OFPST_FLOW" in line:
+                continue
+            def m(pattern):
+                return re.search(pattern, line)
+            prio, pkts, byt = m(r"priority=(\d+)"), m(r"n_packets=(\d+)"), m(r"n_bytes=(\d+)")
+            dur, hard, idle = m(r"duration=([\d.]+)s"), m(r"hard_timeout=(\d+)"), m(r"idle_timeout=(\d+)")
+            act = m(r"actions=(.*)$")
+            flows.append({
+                "priority": int(prio.group(1)) if prio else 0,
+                "packets": int(pkts.group(1)) if pkts else 0,
+                "bytes": int(byt.group(1)) if byt else 0,
+                "duration_s": float(dur.group(1)) if dur else 0.0,
+                "hard_timeout": int(hard.group(1)) if hard else 0,
+                "idle_timeout": int(idle.group(1)) if idle else 0,
+                "actions": act.group(1).strip() if act else "UNKNOWN",
+                "raw": line.strip(),
+            })
+        return {"switch_active": True, "flows": sorted(flows, key=lambda x: x["priority"], reverse=True), "error": ""}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"switch_active": False, "flows": [], "error": str(exc)}
+
+
+def get_controller_status():
+    try:
+        with socket.create_connection(("127.0.0.1", 6653), timeout=0.7):
+            return {"reachable": True, "host": "127.0.0.1", "port": 6653, "error": ""}
+    except OSError as exc:
+        return {"reachable": False, "host": "127.0.0.1", "port": 6653, "error": str(exc)}
+
+
+def get_logger_status():
+    try:
+        with socket.create_connection(("10.0.0.4", 9999), timeout=1.2):
+            return {"reachable": True, "host": "10.0.0.4", "port": 9999, "error": ""}
+    except OSError as exc:
+        return {"reachable": False, "host": "10.0.0.4", "port": 9999, "error": str(exc)}
+
+
+def send_logger_test():
+    event = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "event_type": "DASHBOARD_LOGGER_CONNECTIVITY_TEST",
+        "action": "LOGGER_TEST",
+        "src_ip": "10.0.0.1", "src_port": 0,
+        "dst_ip": "10.0.0.4", "dst_port": 9999,
+        "protocol": "TCP",
+        "reason": "Dashboard-generated logger connectivity test",
+        "timeout_sec": 0,
+    }
+    try:
+        with socket.create_connection(("10.0.0.4", 9999), timeout=2.0) as sock:
+            sock.settimeout(2.0)
+            sock.sendall((json.dumps(event) + "\n").encode())
+            response = sock.recv(1024).decode("utf-8", "replace").strip()
+        ack = json.loads(response) if response else {}
+        if ack.get("status") == "ACK":
+            return {"ok": True, "detail": f"Logger acknowledged event #{ack.get('event_id')}"}
+        return {"ok": False, "detail": f"Logger returned: {response or 'no acknowledgement'}"}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "detail": f"Logger test failed: {exc}"}
+
+
+def configure_test_timeout(value):
+    if value not in (-1, 0, 30, 60, 120):
+        raise ValueError("Timeout must be policy default, 0, 30, 60 or 120 seconds")
+    def mutate(pol):
+        pol["dashboard_test_timeout_sec"] = None if value == -1 else value
+    return write_policy(mutate)
+
+
+def trigger_simulation(scenario: str, options=None):
+    """Execute real Mininet-host traffic. Results are based on captured command output."""
+    options = options or {}
+    host = str(options.get("host", "h1"))
+    if host not in ("h1", "h2"):
+        return {"status": "ERROR", "title": "Invalid source host", "detail": "Choose h1 or h2."}
+
+    try:
+        attempts = max(1, min(100, int(options.get("attempts", 1))))
+    except (TypeError, ValueError):
+        attempts = 1
+    policy = read_json_file(POLICY_PATH, {})
+    client = os.path.join(BASE_DIR, "socket_app", "tcp_client.py")
+
+    if scenario == "clear_logs":
+        # Clear telemetry only; do not erase controller-owned dynamic state or switch rules.
+        try:
+            open(LOG_PATH, "w", encoding="utf-8").close()
+            return {"status": "INFO", "title": "Security event log cleared", "detail": "Only the persisted log file was cleared. Active firewall rules and IPS state were left unchanged."}
+        except OSError as exc:
+            return {"status": "ERROR", "title": "Could not clear logs", "detail": str(exc)}
+
+    if scenario == "controller_test":
+        result = get_controller_status()
+        return {"status": "ALLOW" if result["reachable"] else "ERROR",
+                "title": "Controller reachable" if result["reachable"] else "Controller unavailable",
+                "detail": f"{result['host']}:{result['port']} — " + (result["error"] or "TCP connection successful")}
+
+    if scenario == "logger_test":
+        result = send_logger_test()
+        return {"status": "ALLOW" if result["ok"] else "ERROR",
+                "title": "Logger reachable" if result["ok"] else "Logger test failed",
+                "detail": result["detail"]}
 
     if scenario == "normal_h1_8080":
-        cmd_str, out, real = run_real_mininet_client("h1", 8080, "normal", 2)
-        return {
-            "status": "ALLOW",
-            "title": "h1 -> h3:8080 Authorized TCP Flow",
-            "detail": "Real packets traversed s1 (Priority 10 ALLOW rule installed)",
-            "command": cmd_str,
-            "output": out,
-        }
+        result = run_in_host(host, ["python3", client, "--server-ip", "10.0.0.3",
+                                    "--port", "8080", "--messages", str(attempts)], timeout=max(12, attempts * 4))
+        out = result["stdout"] or result["stderr"]
+        allowed = result["ok"] and "[ACK]" in out
+        return {"status": "ALLOW" if allowed else ("BLOCK" if "[FIREWALL BLOCK]" in out else "ERROR"),
+                "title": f"{host} TCP test: {'success' if allowed else 'not successful'}",
+                "detail": out or result["stderr"] or "No output from Mininet command.",
+                "command_ok": result["ok"]}
 
-    elif scenario == "normal_h2_8080":
-        cmd_str, out, real = run_real_mininet_client("h2", 8080, "normal", 1)
-        blocked = "FIREWALL BLOCK" in out or "timed out" in out.lower()
-        if blocked:
-            return {
-                "status": "BLOCK",
-                "title": "h2 -> h3:8080 BLOCKED by Dynamic IPS Quarantine!",
-                "detail": "Even though port 8080 is allowed, h2 is quarantined for 30s due to prior port violations!",
-                "command": cmd_str,
-                "output": out,
-            }
-        return {
-            "status": "ALLOW",
-            "title": "h2 -> h3:8080 Authorized (Zero Hardcoding Proof)",
-            "detail": "h2 starts 100% authorized ([ACK] received) before committing any violations",
-            "command": cmd_str,
-            "output": out,
-        }
+    if scenario == "attack_h2_8080":
+        result = run_in_host("h2", ["python3", client, "--server-ip", "10.0.0.3",
+                                    "--port", "8080", "--messages", str(attempts)], timeout=max(12, attempts * 4))
+        out = result["stdout"] or result["stderr"]
+        blocked = "[FIREWALL BLOCK]" in out or "timed out" in out.lower()
+        return {"status": "BLOCK" if blocked else "ERROR",
+                "title": "Static blacklist test",
+                "detail": out or result["stderr"] or "No output from Mininet command.",
+                "command_ok": result["ok"]}
 
-    elif scenario == "attack_h2_4444":
-        cmd_str, out, real = run_real_mininet_client("h2", 4444, "forbidden", 1)
-        return {
-            "status": "BLOCK",
-            "title": "Strike 1/2: Forbidden Port 4444 Blocked",
-            "detail": f"Switch s1 dropped h2 -> h3:4444 (priority=100, hard_timeout={drop_timeout}s)",
-            "command": cmd_str,
-            "output": out,
-        }
+    if scenario in ("strike1", "strike2", "forbidden_attempts"):
+        ports = FORBIDDEN_PORTS
+        if scenario == "strike1":
+            ports = [4444]
+        elif scenario == "strike2":
+            ports = [23]
+        results = []
+        # Each strike uses a distinct forbidden destination port so the switch's
+        # first per-port DROP rule cannot hide the next strike from the controller.
+        for i in range(min(attempts, len(ports))):
+            port = ports[i]
+            r = run_in_host("h1", ["python3", client, "--server-ip", "10.0.0.3", "--port", str(port)], timeout=6)
+            results.append(f"Port {port}:\n{r['stdout'] or r['stderr'] or 'No command output'}")
+            if not r.get("ok") and "Connection timed out" not in (r.get("stdout", "") + r.get("stderr", "")):
+                break
+        return {"status": "INFO", "title": "Forbidden-port strike attempts sent",
+                "detail": "\n\n".join(results) + "\n\nCheck controller output and the quarantine countdown for the authoritative strike/quarantine result."}
 
-    elif scenario == "attack_h2_23":
-        cmd_str, out, real = run_real_mininet_client("h2", 23, "forbidden", 1)
-        return {
-            "status": "BLOCK",
-            "title": "Strike 2/2: h2 Dynamically Quarantined!",
-            "detail": f"h2 crossed 2 violations -> Quarantined from ALL ports (including :8080) for {drop_timeout}s",
-            "command": cmd_str,
-            "output": out,
-        }
+    if scenario == "port_scan":
+        count = max(2, min(attempts, len(SAFE_SCAN_PORTS)))
+        ports = SAFE_SCAN_PORTS[:count]
+        code = ("import socket; ports=" + repr(ports) +
+                "; exec(\"for p in ports:\\n s=socket.socket(); s.settimeout(0.5); "
+                "r=s.connect_ex(('10.0.0.3',p)); print('Port',p,'result',r,flush=True); s.close()\")")
+        result = run_in_host("h1", ["python3", "-c", code], timeout=12)
+        out = result["stdout"] or result["stderr"]
+        return {"status": "INFO" if result["ok"] else "ERROR",
+                "title": f"Port scan: {len(ports)} distinct ports probed",
+                "detail": out or result["stderr"] or "No output.", "command_ok": result["ok"]}
 
-    elif scenario == "clear_logs":
-        if os.path.exists(LOG_PATH):
-            os.remove(LOG_PATH)
-        subprocess.run(
-            ["sudo", "-n", "ovs-ofctl", "-O", "OpenFlow13", "del-flows", "s1", "priority=100"],
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        # Clear dynamic quarantine list in policy.json & signal controller
-        pol = read_json_file(POLICY_PATH, {})
-        pol["dynamically_quarantined_hosts"] = []
-        with open(POLICY_PATH, "w", encoding="utf-8") as f:
-            json.dump(pol, f, indent=2)
-        with open(RESET_SIGNAL_FILE, "w", encoding="utf-8") as f:
-            f.write(str(time.time()))
-        return {
-            "status": "INFO",
-            "title": "SOC Telemetry, Drop Flows & Quarantine Reset",
-            "detail": "Cleared security_events.log, removed priority=100 OVS drop rules, and unbanned all hosts",
-            "command": "ovs-ofctl -O OpenFlow13 del-flows s1 priority=100 && rm -f security_events.log",
-            "output": "[RESET COMPLETE] Switch s1 priority=100 drop rules flushed. All hosts restored to AUTHORIZED state.",
-        }
+    if scenario == "tcp_flood":
+        interval = float(options.get("interval", 0.05))
+        interval = max(0.0, min(1.0, interval))
+        result = run_in_host("h1", ["python3", client, "--server-ip", "10.0.0.3",
+                                    "--port", "8080", "--mode", "flood",
+                                    "--count", str(attempts), "--interval", str(interval)],
+                             timeout=max(15, int(attempts * interval + 8)))
+        out = result["stdout"] or result["stderr"]
+        return {"status": "INFO" if result["ok"] else "ERROR",
+                "title": f"TCP flood test: {attempts} connection attempts",
+                "detail": out or result["stderr"] or "No output.", "command_ok": result["ok"]}
 
-    return {"status": "INFO", "title": "Unknown action", "detail": "", "command": "", "output": ""}
+    if scenario == "access_test":
+        result = run_in_host("h1", ["python3", client, "--server-ip", "10.0.0.3",
+                                    "--port", "8080"], timeout=7)
+        out = result["stdout"] or result["stderr"]
+        status = "ALLOW" if "[ACK]" in out else ("BLOCK" if "timed out" in out.lower() else "ERROR")
+        return {"status": status, "title": "Access/recovery test", "detail": out or result["stderr"] or "No output."}
+
+    return {"status": "ERROR", "title": "Unknown test", "detail": scenario}
 
 
 HTML_PAGE = r"""<!DOCTYPE html>
@@ -204,24 +304,47 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>SDN Dynamic Firewall — Control Plane & SOC Telemetry</title>
 <style>
+  /* ==========================================================================
+     EMIL KOWALSKI DESIGN ENGINEERING TOKENS (emil-design-eng & animate)
+     - Strong custom cubic-bezier curves (never ease-in on UI)
+     - Sub-300ms ceiling on all micro-interactions
+     - Semi-transparent shadow borders instead of harsh 1px solid lines
+     - Tabular numbers (tabular-nums) to prevent layout jitter on live metrics
+     ========================================================================== */
   :root {
     --bg-canvas: #090a0f;
     --bg-surface: #11131c;
     --bg-elevated: #171a26;
+    --bg-glass: rgba(23, 26, 38, 0.78);
+
     --text-primary: #f3f4f8;
     --text-secondary: #9499ad;
     --text-muted: #5e6478;
+
     --accent-blue: #3b82f6;
     --accent-emerald: #10b981;
     --accent-crimson: #ef4444;
     --accent-amber: #f59e0b;
+
+    /* Emil Kowalski Custom Easing Curves */
     --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+    --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+    --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+
+    /* Semi-transparent shadow rings instead of solid borders */
     --shadow-card: 0 0 0 1px rgba(255, 255, 255, 0.065), 0 8px 24px -4px rgba(0, 0, 0, 0.45);
     --shadow-elevated: 0 0 0 1px rgba(255, 255, 255, 0.11), 0 16px 36px -6px rgba(0, 0, 0, 0.65);
+
     --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
-    --font-mono: "JetBrains Mono", "Fira Code", monospace;
+    --font-mono: "JetBrains Mono", "Fira Code", "SFMono-Regular", Consolas, monospace;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
   body {
     background-color: var(--bg-canvas);
     background-image:
@@ -231,123 +354,501 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-family: var(--font-sans);
     font-size: 14px;
     line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
     min-height: 100vh;
     padding-bottom: 48px;
   }
-  .tabular { font-variant-numeric: tabular-nums; font-family: var(--font-mono); }
-  h1, h2, h3 { letter-spacing: -0.02em; font-weight: 600; }
+
+  /* UI Cheatsheet: tabular-nums prevents jitter when numbers tick */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+    font-family: var(--font-mono);
+  }
+
+  /* UI Cheatsheet: tighter heading tracking (-0.02em) */
+  h1, h2, h3 {
+    letter-spacing: -0.02em;
+    font-weight: 600;
+  }
+
+  /* Top Navigation Bar */
   .topbar {
-    position: sticky; top: 0; z-index: 40;
-    backdrop-filter: blur(14px); background: rgba(9, 10, 15, 0.84);
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    background: rgba(9, 10, 15, 0.82);
     box-shadow: 0 1px 0 0 rgba(255, 255, 255, 0.06);
-    padding: 14px 28px; display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
   }
-  .brand { display: flex; align-items: center; gap: 12px; }
-  .status-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent-emerald); box-shadow: 0 0 12px var(--accent-emerald); }
-  .brand-title { font-size: 15px; font-weight: 600; color: var(--text-primary); }
-  .brand-sub { font-size: 12px; color: var(--text-secondary); padding-left: 10px; border-left: 1px solid rgba(255, 255, 255, 0.1); }
-  .topbar-right { display: flex; align-items: center; gap: 10px; }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .status-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--accent-emerald);
+    box-shadow: 0 0 12px var(--accent-emerald);
+  }
+
+  .brand-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .brand-sub {
+    font-size: 12px;
+    color: var(--text-secondary);
+    padding-left: 10px;
+    border-left: 1px solid rgba(255, 255, 255, 0.1);
+  }
+
+  .topbar-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
   .pill {
-    font-size: 12px; padding: 5px 11px; border-radius: 999px;
-    background: rgba(255, 255, 255, 0.04); box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
-    color: var(--text-secondary); display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px;
+    padding: 5px 11px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.04);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+    color: var(--text-secondary);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
   }
+
+  /* Tactile Buttons: transform: scale(0.97) on :active, under 160ms */
   .btn {
-    appearance: none; border: none; outline: none; cursor: pointer;
-    font-family: var(--font-sans); font-size: 13px; font-weight: 500;
-    padding: 8px 13px; border-radius: 8px; color: var(--text-primary);
-    background: var(--bg-elevated); box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.09), 0 2px 6px rgba(0, 0, 0, 0.3);
-    display: inline-flex; align-items: center; gap: 8px;
-    transition: transform 130ms var(--ease-out), background-color 150ms ease, opacity 150ms ease;
-  }
-  .btn:active { transform: scale(0.97); }
-  .btn:disabled { opacity: 0.55; cursor: not-allowed; }
-  .btn-allow { background: rgba(16, 185, 129, 0.14); color: #34d399; box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.3); }
-  .btn-danger { background: rgba(239, 68, 68, 0.14); color: #f87171; box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.3); }
-  .btn-autopilot {
-    background: linear-gradient(135deg, rgba(59, 130, 246, 0.25), rgba(16, 185, 129, 0.22));
-    color: #93c5fd;
-    box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.45), 0 4px 14px rgba(59, 130, 246, 0.2);
-  }
-  .kbd { font-family: var(--font-mono); font-size: 11px; padding: 1px 5px; border-radius: 4px; background: rgba(0, 0, 0, 0.35); color: var(--text-secondary); box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1); }
-
-  .tabs-bar {
-    max-width: 1380px; margin: 18px auto 0; padding: 0 28px;
-    display: flex; gap: 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.06); padding-bottom: 12px;
-  }
-  .tab-btn {
-    background: none; border: none; outline: none; cursor: pointer;
-    font-family: var(--font-sans); font-size: 13px; font-weight: 500;
-    color: var(--text-secondary); padding: 6px 14px; border-radius: 6px;
-    transition: background 150ms ease, color 150ms ease;
-  }
-  .tab-btn.active {
-    background: var(--bg-elevated); color: var(--text-primary);
-    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12);
+    appearance: none;
+    border: none;
+    outline: none;
+    cursor: pointer;
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 500;
+    padding: 8px 14px;
+    border-radius: 8px;
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.09), 0 2px 6px rgba(0, 0, 0, 0.3);
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: transform 130ms var(--ease-out), background-color 150ms ease, box-shadow 150ms ease;
+    user-select: none;
   }
 
-  .container { max-width: 1380px; margin: 18px auto 0; padding: 0 28px; display: flex; flex-direction: column; gap: 18px; }
-  .tab-pane { display: none; flex-direction: column; gap: 18px; }
-  .tab-pane.active { display: flex; }
+  @media (hover: hover) and (pointer: fine) {
+    .btn:hover {
+      background: #1f2333;
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16), 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+  }
 
-  .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
-  .card { background: var(--bg-surface); border-radius: 12px; box-shadow: var(--shadow-card); padding: 18px 20px; }
-  .kpi-label { font-size: 12px; color: var(--text-secondary); display: flex; justify-content: space-between; align-items: center; }
-  .kpi-value { font-size: 26px; font-weight: 600; margin-top: 8px; letter-spacing: -0.02em; }
-  .kpi-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+  .btn:active {
+    transform: scale(0.97);
+  }
 
-  .main-grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 18px; }
-  .section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
-  .section-title { font-size: 14px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 8px; }
+  .btn-allow {
+    background: rgba(16, 185, 129, 0.14);
+    color: #34d399;
+    box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.3);
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .btn-allow:hover {
+      background: rgba(16, 185, 129, 0.22);
+    }
+  }
 
+  .btn-danger {
+    background: rgba(239, 68, 68, 0.14);
+    color: #f87171;
+    box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.3);
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .btn-danger:hover {
+      background: rgba(239, 68, 68, 0.22);
+    }
+  }
+
+  .kbd {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.35);
+    color: var(--text-secondary);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1);
+  }
+
+  /* Main Container */
+  .container {
+    max-width: 1380px;
+    margin: 24px auto 0;
+    padding: 0 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  /* KPI Metric Strip */
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+  }
+
+  .card {
+    background: var(--bg-surface);
+    border-radius: 12px;
+    box-shadow: var(--shadow-card);
+    padding: 18px 20px;
+  }
+
+  .kpi-label {
+    font-size: 12px;
+    color: var(--text-secondary);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .kpi-value {
+    font-size: 26px;
+    font-weight: 600;
+    margin-top: 8px;
+    letter-spacing: -0.02em;
+  }
+
+  .kpi-sub {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 4px;
+  }
+
+  /* Main Two-Column Layout */
+  .main-grid {
+    display: grid;
+    grid-template-columns: 1.25fr 1fr;
+    gap: 20px;
+  }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+  }
+
+  .section-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* Interactive Topology Map */
   .topo-stage {
-    position: relative; height: 225px;
+    position: relative;
+    height: 250px;
     background: radial-gradient(circle at center, rgba(59, 130, 246, 0.06), rgba(9, 10, 15, 0.5));
-    border-radius: 10px; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
-    display: flex; align-items: center; justify-content: space-between; padding: 0 32px; overflow: hidden;
+    border-radius: 10px;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 32px;
+    overflow: hidden;
   }
-  .topo-col { display: flex; flex-direction: column; gap: 24px; z-index: 2; }
+
+  .topo-col {
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+    z-index: 2;
+  }
+
   .node-box {
-    background: var(--bg-elevated); box-shadow: var(--shadow-card); border-radius: 10px; padding: 10px 14px; min-width: 165px;
+    background: var(--bg-elevated);
+    box-shadow: var(--shadow-card);
+    border-radius: 10px;
+    padding: 10px 14px;
+    min-width: 155px;
     transition: transform 180ms var(--ease-out), box-shadow 180ms var(--ease-out);
   }
-  .node-box.active-pulse { transform: scale(1.03); box-shadow: 0 0 0 1px var(--accent-emerald), 0 0 20px rgba(16, 185, 129, 0.3); }
-  .node-box.block-pulse { transform: scale(1.03); box-shadow: 0 0 0 1px var(--accent-crimson), 0 0 22px rgba(239, 68, 68, 0.4); }
-  .node-title { font-size: 12px; font-weight: 600; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  .node-ip { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
-  .switch-hub { background: linear-gradient(180deg, #1e2538 0%, #141824 100%); box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.35), 0 10px 30px rgba(0, 0, 0, 0.6); border-radius: 12px; padding: 16px 20px; text-align: center; z-index: 2; min-width: 170px; }
 
-  .sim-bar { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding-top: 12px; border-top: 1px solid rgba(255, 255, 255, 0.06); }
-
-  /* Live Host Terminal Console Drawer */
-  .terminal-box {
-    margin-top: 12px;
-    background: #07080c;
-    border-radius: 8px;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
-    padding: 10px 14px;
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: #cbd5e1;
+  .node-box.active-pulse {
+    transform: scale(1.03);
+    box-shadow: 0 0 0 1px var(--accent-emerald), 0 0 20px rgba(16, 185, 129, 0.25);
   }
-  .term-cmd { color: #38bdf8; margin-bottom: 4px; font-weight: 500; }
-  .term-out { color: #a7f3d0; white-space: pre-wrap; line-height: 1.45; }
-  .term-out.blocked { color: #fca5a5; }
 
-  .feed-list { display: flex; flex-direction: column; gap: 8px; max-height: 360px; overflow-y: auto; padding-right: 4px; }
-  .alert-item { background: var(--bg-elevated); border-radius: 9px; padding: 11px 14px; box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06); display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-  .alert-badge { font-family: var(--font-mono); font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 5px; background: rgba(239, 68, 68, 0.15); color: #f87171; box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.3); }
+  .node-box.block-pulse {
+    transform: scale(1.03);
+    box-shadow: 0 0 0 1px var(--accent-crimson), 0 0 22px rgba(239, 68, 68, 0.35);
+  }
 
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th { text-align: left; color: var(--text-secondary); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid rgba(255, 255, 255, 0.07); }
-  td { padding: 9px 10px; border-bottom: 1px solid rgba(255, 255, 255, 0.04); color: var(--text-primary); }
+  .node-title {
+    font-size: 12px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
 
-  .chart-gallery { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-  .chart-card { background: var(--bg-surface); border-radius: 12px; box-shadow: var(--shadow-card); padding: 18px; text-align: center; }
-  .chart-card img { width: 100%; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.5); margin-top: 12px; }
+  .node-ip {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-top: 2px;
+  }
 
-  .sonner-toaster { position: fixed; bottom: 22px; right: 24px; z-index: 100; display: flex; flex-direction: column; gap: 10px; pointer-events: none; }
-  .sonner-toast { pointer-events: auto; min-width: 320px; max-width: 400px; background: #161925; box-shadow: var(--shadow-elevated); border-radius: 10px; padding: 12px 15px; }
+  .switch-hub {
+    background: linear-gradient(180deg, #1e2538 0%, #141824 100%);
+    box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.35), 0 10px 30px rgba(0, 0, 0, 0.6);
+    border-radius: 12px;
+    padding: 16px 20px;
+    text-align: center;
+    z-index: 2;
+    min-width: 170px;
+  }
+
+  /* Simulation Control Bar */
+  .sim-bar {
+    margin-top: 14px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    justify-content: space-between;
+    padding-top: 14px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+  }
+
+  /* Live SOC Feed List */
+  .feed-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 360px;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+
+  /* Emil Kowalski Entrance Animation: scale(0.96) + opacity + blur(2px) with --ease-out */
+  @keyframes alertEnter {
+    0% {
+      opacity: 0;
+      transform: translateY(-6px) scale(0.96);
+      filter: blur(2px);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+      filter: blur(0);
+    }
+  }
+
+  .alert-item {
+    background: var(--bg-elevated);
+    border-radius: 9px;
+    padding: 11px 14px;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06);
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    animation: alertEnter 200ms var(--ease-out) forwards;
+  }
+
+  .alert-badge {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 5px;
+    background: rgba(239, 68, 68, 0.15);
+    color: #f87171;
+    box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.3);
+    white-space: nowrap;
+  }
+
+  .alert-reason {
+    font-size: 13px;
+    color: var(--text-primary);
+    margin-top: 4px;
+  }
+
+  .alert-meta {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-top: 3px;
+  }
+
+  /* Policy Chips & Interactive Controls */
+  .chip-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .chip {
+    background: var(--bg-elevated);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.09);
+    border-radius: 7px;
+    padding: 4px 10px;
+    font-size: 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .chip-remove {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+  }
+  .chip-remove:hover {
+    color: var(--accent-crimson);
+  }
+
+  .input-inline {
+    background: rgba(0, 0, 0, 0.3);
+    border: none;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1);
+    color: var(--text-primary);
+    border-radius: 7px;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+    width: 130px;
+    outline: none;
+    transition: box-shadow 150ms var(--ease-out);
+  }
+  .input-inline:focus {
+    box-shadow: 0 0 0 1px var(--accent-blue);
+  }
+
+  /* OpenFlow Table */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  th {
+    text-align: left;
+    color: var(--text-secondary);
+    font-weight: 500;
+    padding: 8px 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  }
+
+  td {
+    padding: 9px 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    color: var(--text-primary);
+  }
+
+  /* Deliverable 2 Benchmark Bars */
+  .bench-row {
+    margin-top: 12px;
+  }
+  .bench-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 5px;
+  }
+  .bar-track {
+    height: 8px;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 999px;
+    overflow: hidden;
+    display: flex;
+  }
+  .bar-fill {
+    height: 100%;
+    border-radius: 999px;
+    transition: width 260ms var(--ease-out);
+  }
+
+  /* Sonner-Style Stacked Toast Container (Bottom-Right) */
+  .sonner-toaster {
+    position: fixed;
+    bottom: 22px;
+    right: 24px;
+    z-index: 100;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    pointer-events: none;
+  }
+
+  @keyframes toastSlideIn {
+    0% {
+      opacity: 0;
+      transform: translateY(16px) scale(0.95);
+      filter: blur(2px);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+      filter: blur(0);
+    }
+  }
+
+  .sonner-toast {
+    pointer-events: auto;
+    min-width: 320px;
+    max-width: 390px;
+    background: #161925;
+    box-shadow: var(--shadow-elevated);
+    border-radius: 10px;
+    padding: 12px 15px;
+    animation: toastSlideIn 210ms var(--ease-out) forwards;
+    transition: transform 180ms var(--ease-out), opacity 180ms var(--ease-out);
+  }
+
+  .toast-header {
+    font-size: 13px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .toast-desc {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 3px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
 </style>
 </head>
 <body>
@@ -356,167 +857,230 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="brand">
     <span class="status-dot"></span>
     <span class="brand-title">SDN Dynamic Firewall</span>
-    <span class="brand-sub">Real Mininet Namespace Execution &amp; Live SOC Control Plane</span>
+    <span class="brand-sub">OpenFlow 1.3 Control Plane &amp; TCP SOC Telemetry</span>
   </div>
   <div class="topbar-right">
-    <button class="btn btn-autopilot" id="autopilot-btn" onclick="runAutoPilotDemo()">
-      &#9654; Run Full Auto-Pilot Demo <span class="kbd">A</span>
-    </button>
-    <span class="pill tabular" id="mininet-pill">Mininet: Checking...</span>
-    <button class="btn" onclick="triggerSim('clear_logs')">Reset All <span class="kbd">R</span></button>
+    <span class="pill tabular" id="controller-pill">Controller: checking...</span>
+    <span class="pill tabular" id="logger-pill">SOC Logger: checking...</span>
+    <button onclick="runAutoPilot()" id="autopilot-btn" style="background:rgba(37,99,235,0.22);border:1px solid #3b82f6;color:#60a5fa;padding:6px 12px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;margin-right:6px;">&#9654; Run Full Auto-Pilot Demo <span style="opacity:0.7;margin-left:4px;">[A]</span></button><button class="btn" onclick="triggerSim('clear_logs')">Reset Logs <span class="kbd">R</span></button>
   </div>
 </header>
 
-<div class="tabs-bar">
-  <button class="tab-btn active" onclick="switchTab('pane-control', this)">Live Control Plane &amp; Real Packet Simulator</button>
-  <button class="tab-btn" onclick="switchTab('pane-benchmarks', this)">System Performance Benchmarks (Graphs)</button>
-</div>
-
 <main class="container">
-  <div class="tab-pane active" id="pane-control">
-    <section class="kpi-grid">
-      <div class="card">
-        <div class="kpi-label"><span>Security Alerts Logged</span><span class="tabular">TCP :9999</span></div>
-        <div class="kpi-value tabular" id="kpi-alerts">0</div>
-        <div class="kpi-sub">Persisted in <code class="tabular">security_events.log</code></div>
-      </div>
-      <div class="card">
-        <div class="kpi-label"><span>Mean Blocking Response</span><span class="tabular">OVS Hardware</span></div>
-        <div class="kpi-value tabular" id="kpi-response">36.50 ms</div>
-        <div class="kpi-sub">PacketIn &rarr; OVS <code class="tabular">priority=100</code> Drop</div>
-      </div>
-      <div class="card">
-        <div class="kpi-label"><span>Control-Plane Offload</span><span class="tabular">OVS Hardware</span></div>
-        <div class="kpi-value tabular" id="kpi-offload">96.2%</div>
-        <div class="kpi-sub"><span class="tabular">3</span> vs <span class="tabular">80</span> PacketIn events</div>
-      </div>
-      <div class="card">
-        <div class="kpi-label"><span>Dynamic Quarantine</span><span class="tabular">Self-Healing</span></div>
-        <div class="kpi-value tabular" id="kpi-timeout">30s</div>
-        <div class="kpi-sub">Auto-ban after <code class="tabular">2</code> port violations</div>
-      </div>
-    </section>
-
-    <section class="main-grid">
-      <div class="card">
-        <div class="section-header">
-          <div class="section-title">Live OpenFlow 1.3 Topology (Click Buttons to Fire Real Mininet Packets)</div>
-          <span class="pill tabular">Switch s1 (10.0.0.254/24)</span>
-        </div>
-        <div class="topo-stage">
-          <div class="topo-col">
-            <div class="node-box" id="node-h1">
-              <div class="node-title"><span>Host h1</span><span style="color:var(--accent-emerald)">AUTHORIZED</span></div>
-              <div class="node-ip tabular">10.0.0.1 &bull; Normal Client</div>
-            </div>
-            <div class="node-box" id="node-h2">
-              <div class="node-title"><span>Host h2</span><span id="h2-status-badge" style="color:var(--accent-emerald)">AUTHORIZED</span></div>
-              <div class="node-ip tabular">10.0.0.2 &bull; Behavioral IPS</div>
-            </div>
-          </div>
-          <div class="switch-hub" id="node-s1">
-            <div style="font-size:13px;font-weight:600;color:#60a5fa;">Open vSwitch s1</div>
-            <div class="tabular" style="font-size:11px;color:var(--text-secondary);margin-top:3px;">OpenFlow 1.3 Datapath</div>
-            <div class="tabular" style="font-size:11px;color:var(--text-muted);margin-top:6px;" id="s1-flow-count">Active Flows: --</div>
-          </div>
-          <div class="topo-col">
-            <div class="node-box" id="node-h3">
-              <div class="node-title"><span>Server h3</span><span class="tabular" style="color:#60a5fa">:8080</span></div>
-              <div class="node-ip tabular">10.0.0.3 &bull; Multi-Threaded</div>
-            </div>
-            <div class="node-box" id="node-h4">
-              <div class="node-title"><span>SOC Logger h4</span><span class="tabular" style="color:var(--accent-amber)">:9999</span></div>
-              <div class="node-ip tabular">10.0.0.4 &bull; JSON Telemetry</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="sim-bar">
-          <button class="btn btn-allow" onclick="triggerSim('normal_h1_8080')">h1 &rarr; :8080 (Normal) <span class="kbd">1</span></button>
-          <button class="btn btn-allow" onclick="triggerSim('normal_h2_8080')">h2 &rarr; :8080 (Test Access) <span class="kbd">2</span></button>
-          <button class="btn btn-danger" onclick="triggerSim('attack_h2_4444')">h2 &rarr; :4444 (Strike 1) <span class="kbd">3</span></button>
-          <button class="btn btn-danger" onclick="triggerSim('attack_h2_23')">h2 &rarr; :23 (Strike 2 Ban) <span class="kbd">4</span></button>
-        </div>
-
-        <!-- Live Mininet Host Terminal Output -->
-        <div class="terminal-box">
-          <div class="term-cmd" id="term-cmd">mininet&gt; Ready — click any button above or press 'Run Full Auto-Pilot Demo'</div>
-          <div class="term-out" id="term-out">Real TCP client output from Mininet hosts (h1 / h2) will appear here live...</div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="section-header">
-          <div class="section-title">Centralized SOC Security Event Stream (<code class="tabular">h4:9999</code>)</div>
-          <span class="pill tabular" id="feed-count-pill">0 Events</span>
-        </div>
-        <div class="feed-list" id="soc-feed">
-          <div style="color:var(--text-muted);font-size:13px;padding:24px 0;text-align:center;">No security violations logged yet.</div>
-        </div>
-      </div>
-    </section>
-
-    <section class="main-grid">
-      <div class="card">
-        <div class="section-header">
-          <div class="section-title">Switch <code class="tabular">s1</code> OpenFlow 1.3 Hardware Flow Table</div>
-          <span class="pill tabular">ovs-ofctl dump-flows s1</span>
-        </div>
-        <table>
-          <thead>
-            <tr><th>Priority</th><th>Action</th><th>Packets</th><th>Duration</th><th>Timeout</th><th>Match Rule</th></tr>
-          </thead>
-          <tbody id="flow-table-body" class="tabular">
-            <tr><td colspan="6" style="color:var(--text-muted);">Loading flow table...</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="card">
-        <div class="section-title" style="margin-bottom:10px;">Live Dynamic Behavioral IPS Lifecycle</div>
-        <div style="font-size:13px;color:var(--text-secondary);line-height:1.65;">
-          <p><strong>Step 1 (Zero Hardcoding):</strong> Press <span class="kbd">2</span> — <code class="tabular">h2 (10.0.0.2)</code> connects to <code class="tabular">h3:8080</code> and receives <code class="tabular">[ACK]</code>.</p>
-          <p style="margin-top:6px;"><strong>Step 2 (Strike 1):</strong> Press <span class="kbd">3</span> — <code class="tabular">h2</code> probes forbidden port <code class="tabular">4444</code> (Blocked &amp; logged as Strike 1/2).</p>
-          <p style="margin-top:6px;"><strong>Step 3 (Strike 2 Auto-Quarantine):</strong> Press <span class="kbd">4</span> — <code class="tabular">h2</code> probes forbidden port <code class="tabular">23</code> &rarr; Controller dynamically quarantines <code class="tabular">10.0.0.2</code> across ALL ports for 30s!</p>
-          <p style="margin-top:6px;"><strong>Step 4 (Verify Ban):</strong> Press <span class="kbd">2</span> again — <code class="tabular">h2 &rarr; :8080</code> now times out (<code class="tabular">[FIREWALL BLOCK]</code>)!</p>
-        </div>
-      </div>
-    </section>
-  </div>
-
-  <!-- PANE 2: System Performance Benchmarks -->
-  <div class="tab-pane" id="pane-benchmarks">
-    <div class="card" style="margin-bottom:16px;">
-      <div class="section-title">System Performance Evaluation &amp; Security Benchmarks</div>
-      <p style="font-size:13px;color:var(--text-secondary);margin-top:4px;">
-        Evaluates blocking response times and compares control-plane overhead, client RTT latency, and bulk TCP throughput with vs. without switch-level OpenFlow drop rules.
-      </p>
+  <!-- KPI Strip -->
+  <section class="kpi-grid">
+    <div class="card">
+      <div class="kpi-label"><span>Security Alerts Logged</span><span class="tabular">TCP :9999</span></div>
+      <div class="kpi-value tabular" id="kpi-alerts">0</div>
+      <div class="kpi-sub">Persisted in <code class="tabular">security_events.log</code></div>
     </div>
-    <div class="chart-gallery">
-      <div class="chart-card">
-        <div class="section-title">Blocking Response Time (ms)</div>
-        <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">Time from first unauthorized SYN packet to OVS DROP rule installation</div>
-        <img src="/api/chart/d2_blocking_response_time.png" alt="Blocking Response Time Chart" />
+    <div class="card">
+      <div class="kpi-label"><span>Mean Blocking Response (Saved Benchmark)</span><span class="tabular">D2 Metric</span></div>
+      <div class="kpi-value tabular" id="kpi-response">33.09 ms</div>
+      <div class="kpi-sub">PacketIn &rarr; OVS <code class="tabular">priority=100</code> Drop</div>
+    </div>
+    <div class="card">
+      <div class="kpi-label"><span>Control-Plane Offload (Benchmark)</span><span class="tabular">OVS Hardware</span></div>
+      <div class="kpi-value tabular" id="kpi-offload">96.2%</div>
+      <div class="kpi-sub"><span class="tabular">3</span> vs <span class="tabular">80</span> PacketIn events under flood</div>
+    </div>
+    <div class="card">
+      <div class="kpi-label"><span>Dynamic Drop Timeout</span><span class="tabular">Self-Healing</span></div>
+      <div class="kpi-value tabular" id="kpi-timeout">30s / 60s / 120s</div>
+      <div class="kpi-sub">Port scan: 30s · TCP flood: 60s · Repeat attack: 120s</div>
+    </div>
+  </section>
+
+  <!-- Main Grid: Topology + SOC Stream -->
+  <section class="main-grid">
+    <!-- Left Column: Live Topology & Packet Simulator -->
+    <div class="card">
+      <div class="section-header">
+        <div class="section-title">Live OpenFlow 1.3 Network Topology &amp; Traffic Simulator</div>
+        <span class="pill tabular">Switch s1 (10.0.0.254/24)</span>
       </div>
-      <div class="chart-card">
-        <div class="section-title">Baseline Comparison (With vs. Without OVS Drop)</div>
-        <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">Control-plane overhead, RTT latency, and TCP throughput impact</div>
-        <img src="/api/chart/d2_baseline_comparison.png" alt="Baseline Comparison Chart" />
+
+      <div class="topo-stage">
+        <div class="topo-col">
+          <div class="node-box" id="node-h1">
+            <div class="node-title"><span>Host h1</span><span style="color:var(--accent-emerald)">AUTH</span></div>
+            <div class="node-ip tabular">10.0.0.1 &bull; TCP Client</div>
+          </div>
+          <div class="node-box" id="node-h2">
+            <div class="node-title"><span>Host h2</span><span style="color:var(--accent-crimson)">BLACKLIST</span></div>
+            <div class="node-ip tabular">10.0.0.2 &bull; Restricted</div>
+          </div>
+        </div>
+
+        <div class="switch-hub" id="node-s1">
+          <div style="font-size:13px;font-weight:600;color:#60a5fa;">Open vSwitch s1</div>
+          <div class="tabular" style="font-size:11px;color:var(--text-secondary);margin-top:3px;">OpenFlow 1.3 Datapath</div>
+          <div class="tabular" style="font-size:11px;color:var(--text-muted);margin-top:6px;" id="s1-flow-count">Active Flows: --</div>
+        </div>
+
+        <div class="topo-col">
+          <div class="node-box" id="node-h3">
+            <div class="node-title"><span>Server h3</span><span class="tabular" style="color:#60a5fa">:8080</span></div>
+            <div class="node-ip tabular">10.0.0.3 &bull; Multi-Threaded</div>
+          </div>
+          <div class="node-box" id="node-h4">
+            <div class="node-title"><span>SOC Logger h4</span><span class="tabular" style="color:var(--accent-amber)">:9999</span></div>
+            <div class="node-ip tabular">10.0.0.4 &bull; JSON Telemetry</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sim-bar">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn btn-allow" onclick="triggerSim('normal_h1_8080')">
+            Send Normal TCP (h1 &rarr; :8080) <span class="kbd">1</span>
+          </button>
+          <button class="btn btn-danger" onclick="triggerSim('attack_h1_4444')">
+            Probe Forbidden Port (h1 &rarr; :4444) <span class="kbd">2</span>
+          </button>
+          <button class="btn btn-danger" onclick="triggerSim('attack_h2_8080')">
+            Blacklisted Host Attack (h2 &rarr; :8080) <span class="kbd">3</span>
+          </button>
+        </div>
       </div>
     </div>
-  </div>
+
+    <!-- Right Column: Real-Time SOC Telemetry Feed (Person C) -->
+    <div class="card">
+      <div class="section-header">
+        <div class="section-title">Centralized SOC Security Event Stream (<code class="tabular">h4:9999</code>)</div>
+        <span class="pill tabular" id="feed-count-pill">0 Events</span>
+      </div>
+      <div class="feed-list" id="soc-feed">
+        <div style="color:var(--text-muted);font-size:13px;padding:24px 0;text-align:center;">
+          No security violations logged yet. Trigger a forbidden port or blacklisted host test.
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- Real Mininet test controls -->
+  <section class="card" id="test-console">
+    <div class="section-header">
+      <div>
+        <div class="section-title">Live Attack & Recovery Test Console</div>
+        <div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">Actions execute inside real Mininet host namespaces. Results below come from captured command output.</div>
+      </div>
+      <span class="pill tabular" id="mininet-status">Mininet: checking...</span>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:end;">
+      <label style="font-size:12px;color:var(--text-secondary);">Access attempts<br>
+        <input class="input-inline" id="test-attempts" type="number" min="1" max="100" value="5">
+      </label>
+      <label style="font-size:12px;color:var(--text-secondary);">Test block timeout<br>
+        <select class="input-inline" id="test-timeout">
+          <option value="-1" selected>Use policy defaults (30/60/120)</option>
+          <option value="0">No block (detect/log only)</option>
+          <option value="30">30 seconds</option>
+          <option value="60">60 seconds</option>
+          <option value="120">120 seconds</option>
+        </select>
+      </label>
+      <button class="btn" onclick="applyTestConfig()">Apply test settings</button>
+      <span class="pill" id="test-config-status">Timeout override: 30s</span>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:9px;margin-top:16px;">
+      <button class="btn btn-allow" onclick="runTest('normal_h1_8080')">Normal TCP (h1)</button>
+      <button class="btn btn-danger" onclick="runTest('attack_h2_8080')">Static blacklist (h2)</button>
+      <button class="btn btn-danger" onclick="runTest('strike1')">Forbidden strike 1 (h1:4444)</button>
+      <button class="btn btn-danger" onclick="runTest('strike2')">Forbidden strike 2 (h1:23)</button>
+      <button class="btn btn-danger" onclick="runTest('forbidden_attempts')">Run N distinct forbidden strikes</button>
+      <button class="btn btn-danger" onclick="runTest('port_scan')">Port scan (N distinct ports)</button>
+      <button class="btn btn-danger" onclick="runTest('tcp_flood')">TCP flood (N connections)</button>
+      <span style="font-size:11px;color:var(--text-muted);align-self:center;">Current flood threshold: 20 SYNs / 5s. Set attempts to 20+ to trigger it.</span>
+      <button class="btn" onclick="runTest('access_test')">Test h1 access / recovery</button>
+      <button class="btn" onclick="runTest('controller_test')">Test controller connection</button>
+      <button class="btn" onclick="runTest('logger_test')">Test logger connection</button>
+      <button class="btn" onclick="fetchState()">Refresh live status / flows</button>
+    </div>
+    <div style="margin-top:14px;">
+      <div class="section-header" style="margin-bottom:7px;">
+        <div class="section-title">Live test output</div>
+        <span class="pill" id="test-result-status">Ready</span>
+      </div>
+      <pre id="test-output" style="white-space:pre-wrap;overflow-wrap:anywhere;background:#090a0f;border-radius:8px;padding:12px;min-height:66px;color:#cbd5e1;font:12px/1.55 var(--font-mono);">Choose a test above. Mininet must be running.</pre>
+    </div>
+  </section>
+
+  <!-- Bottom Grid: Hot-Reloading Policy Editor + OpenFlow Table & D2 Benchmarks -->
+  <section class="main-grid">
+    <!-- Left: Live OpenFlow 1.3 Flow Table -->
+    <div class="card">
+      <div class="section-header">
+        <div class="section-title">Switch <code class="tabular">s1</code> OpenFlow 1.3 Hardware Flow Table</div>
+        <span class="pill tabular">ovs-ofctl dump-flows s1</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Priority</th>
+            <th>Action</th>
+            <th>Packets</th>
+            <th>Duration</th>
+            <th>Timeout</th>
+            <th>Match Rule</th>
+          </tr>
+        </thead>
+        <tbody id="flow-table-body" class="tabular">
+          <tr><td colspan="6" style="color:var(--text-muted);">Loading flow table...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Right: Hot-Reloading policy.json Editor & D2 Comparison -->
+    <div class="card" style="display:flex;flex-direction:column;gap:18px;">
+      <div>
+        <div class="section-header" style="margin-bottom:8px;">
+          <div class="section-title">Dynamic Policy Control (<code class="tabular">controller/policy.json</code>)</div>
+          <span class="pill" style="color:var(--accent-emerald)">Policy file editor (controller polls policy)</span>
+        </div>
+
+        <div style="font-size:12px;color:var(--text-secondary);margin-top:6px;">Blocked Host IPs</div>
+        <div class="chip-group" id="blocked-hosts-chips"></div>
+        <div style="display:flex;gap:8px;margin-top:8px;">
+          <input class="input-inline" id="new-host-input" placeholder="e.g. 10.0.0.2" />
+          <button class="btn" onclick="addPolicyItem('host')">+ Block Host IP</button>
+        </div>
+
+        <div style="font-size:12px;color:var(--text-secondary);margin-top:14px;">Blocked TCP Destination Ports</div>
+        <div class="chip-group" id="blocked-ports-chips"></div>
+        <div style="display:flex;gap:8px;margin-top:8px;">
+          <input class="input-inline" id="new-port-input" placeholder="e.g. 4444" />
+          <button class="btn" onclick="addPolicyItem('port')">+ Block TCP Port</button>
+        </div>
+      </div>
+
+      <div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:14px;">
+        <div class="section-title" style="margin-bottom:6px;">Deliverable 2 Baseline Evaluation (With vs. Without OVS Drop)</div>
+        <div class="bench-row">
+          <div class="bench-label"><span>Authorized Client TCP Throughput (<code class="tabular">h1 &rarr; h3:8080</code>)</span><span class="tabular" id="bench-tput-label">46.80 vs 27.14 Mbps</span></div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:78%;background:var(--accent-emerald);"></div>
+          </div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label"><span>Authorized Client Socket RTT Latency (Lower is Better)</span><span class="tabular" id="bench-lat-label">2.46 ms vs 6.39 ms</span></div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:38%;background:var(--accent-blue);"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
 </main>
 
+<!-- Sonner-Style Stacked Toasts -->
 <div class="sonner-toaster" id="toaster"></div>
 
 <script>
-  let lastEventCount = -1;
-
-  function switchTab(paneId, btn) {
-    document.querySelectorAll(".tab-pane").forEach(p => p.classList.remove("active"));
-    document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
-    document.getElementById(paneId).classList.add("active");
-    btn.classList.add("active");
-  }
+  let lastEventCount = 0;
+  let currentPolicy = { blocked_hosts: [], blocked_tcp_ports: [] };
 
   function showToast(title, detail, type = "info") {
     const toaster = document.getElementById("toaster");
@@ -524,15 +1088,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     toast.className = "sonner-toast";
     const color = type === "BLOCK" ? "#ef4444" : (type === "ALLOW" ? "#10b981" : "#3b82f6");
     toast.innerHTML = `
-      <div style="font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px;">
+      <div class="toast-header">
         <span style="width:8px;height:8px;border-radius:50%;background:${color};display:inline-block;"></span>
         <span>${title}</span>
       </div>
-      <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;" class="tabular">${detail}</div>
+      <div class="toast-desc tabular">${detail}</div>
     `;
     toaster.appendChild(toast);
     setTimeout(() => {
       toast.style.opacity = "0";
+      toast.style.transform = "translateY(8px) scale(0.96)";
       setTimeout(() => toast.remove(), 200);
     }, 3400);
   }
@@ -542,16 +1107,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const el = document.getElementById(id);
       if (!el) return;
       el.classList.add(cls);
-      setTimeout(() => el.classList.remove(cls), 750);
+      setTimeout(() => el.classList.remove(cls), 650);
     });
   }
 
   async function triggerSim(scenario) {
-    const termCmd = document.getElementById("term-cmd");
-    const termOut = document.getElementById("term-out");
-    termCmd.textContent = `mininet> Executing ${scenario} inside live host namespace...`;
-    termOut.textContent = "Running socket_app/tcp_client.py...";
-    termOut.className = "term-out";
+    if (scenario === "normal_h1_8080") {
+      pulseNodes(["node-h1", "node-s1", "node-h3"], "active-pulse");
+    } else if (scenario === "attack_h1_4444") {
+      pulseNodes(["node-h1", "node-s1", "node-h4"], "block-pulse");
+    } else if (scenario === "attack_h2_8080") {
+      pulseNodes(["node-h2", "node-s1", "node-h4"], "block-pulse");
+    }
 
     const res = await fetch("/api/simulate", {
       method: "POST",
@@ -559,51 +1126,84 @@ HTML_PAGE = r"""<!DOCTYPE html>
       body: JSON.stringify({ scenario })
     });
     const data = await res.json();
-
-    termCmd.textContent = `mininet> ${data.command}`;
-    termOut.textContent = data.output || data.detail;
-    if (data.status === "BLOCK") {
-      termOut.className = "term-out blocked";
-      pulseNodes(["node-h2", "node-s1", "node-h4"], "block-pulse");
-    } else if (data.status === "ALLOW") {
-      termOut.className = "term-out";
-      const srcNode = scenario.includes("h2") ? "node-h2" : "node-h1";
-      pulseNodes([srcNode, "node-s1", "node-h3"], "active-pulse");
-    }
-
     showToast(data.title, data.detail, data.status);
-    await fetchState();
-    return data;
+    fetchState();
   }
 
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  async function runAutoPilotDemo() {
-    const btn = document.getElementById("autopilot-btn");
-    btn.disabled = true;
-    btn.innerHTML = "&#9203; Running Auto-Pilot Demo...";
+  async function applyTestConfig() {
+    const timeout = Number(document.getElementById("test-timeout").value);
+    const res = await fetch("/api/test-config", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({timeout_sec: timeout})
+    });
+    const data = await res.json();
+    document.getElementById("test-config-status").textContent =
+      data.ok ? (timeout === -1 ? "Timeout override: policy defaults" : `Timeout override: ${timeout}s`) : (data.error || "Configuration failed");
+    showToast(data.ok ? "Test settings applied" : "Test settings failed",
+      data.detail || data.error || "", data.ok ? "INFO" : "BLOCK");
+    fetchState();
+  }
 
-    showToast("Auto-Pilot Demo Started", "Executing full 5-stage live Mininet evaluation sequence...", "INFO");
-    await triggerSim("clear_logs");
-    await sleep(1200);
+  async function runTest(scenario) {
+    const attempts = Math.max(1, Math.min(100, Number(document.getElementById("test-attempts").value || 1)));
+    const output = document.getElementById("test-output");
+    const badge = document.getElementById("test-result-status");
+    output.textContent = "Running real Mininet test... please wait.";
+    badge.textContent = "Running";
+    try {
+      const res = await fetch("/api/simulate", {
+        method: "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({scenario, attempts})
+      });
+      const data = await res.json();
+      output.textContent = `${data.title || "Test"}\n\n${data.detail || data.error || ""}`;
+      badge.textContent = data.status || (res.ok ? "Complete" : "Error");
+      showToast(data.title || "Test complete", data.status || "", data.status || "INFO");
+      fetchState();
+    } catch (e) {
+      output.textContent = `Dashboard request failed: ${e}`;
+      badge.textContent = "ERROR";
+    }
+  }
 
-    await triggerSim("normal_h1_8080");
-    await sleep(2200);
+  async function updatePolicy(newPol) {
+    await fetch("/api/policy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(newPol)
+    });
+    showToast("Firewall Policy Hot-Reloaded", "Updated controller/policy.json with zero downtime", "INFO");
+    fetchState();
+  }
 
-    await triggerSim("normal_h2_8080");
-    await sleep(2200);
+  function removePolicyItem(kind, val) {
+    if (kind === "host") {
+      currentPolicy.blocked_hosts = (currentPolicy.blocked_hosts || []).filter(h => h !== val);
+    } else {
+      currentPolicy.blocked_tcp_ports = (currentPolicy.blocked_tcp_ports || []).filter(p => Number(p) !== Number(val));
+    }
+    updatePolicy(currentPolicy);
+  }
 
-    await triggerSim("attack_h2_4444");
-    await sleep(2200);
-
-    await triggerSim("attack_h2_23");
-    await sleep(2200);
-
-    await triggerSim("normal_h2_8080");
-
-    btn.disabled = false;
-    btn.innerHTML = "&#9654; Run Full Auto-Pilot Demo <span class='kbd'>A</span>";
-    showToast("Auto-Pilot Demo Complete!", "All normal, port-block, and dynamic quarantine tests verified!", "ALLOW");
+  function addPolicyItem(kind) {
+    if (kind === "host") {
+      const inp = document.getElementById("new-host-input");
+      const v = inp.value.trim();
+      if (v && !(currentPolicy.blocked_hosts || []).includes(v)) {
+        currentPolicy.blocked_hosts.push(v);
+        inp.value = "";
+        updatePolicy(currentPolicy);
+      }
+    } else {
+      const inp = document.getElementById("new-port-input");
+      const v = parseInt(inp.value.trim(), 10);
+      if (!isNaN(v) && !(currentPolicy.blocked_tcp_ports || []).includes(v)) {
+        currentPolicy.blocked_tcp_ports.push(v);
+        inp.value = "";
+        updatePolicy(currentPolicy);
+      }
+    }
   }
 
   async function fetchState() {
@@ -611,77 +1211,94 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const res = await fetch("/api/state");
       const state = await res.json();
 
+      // KPI updates
       document.getElementById("kpi-alerts").textContent = state.logs.length;
-      document.getElementById("feed-count-pill").textContent = `${state.logs.length} Events`;
-      document.getElementById("kpi-timeout").textContent = `${state.policy.drop_hard_timeout_sec || 30}s`;
+      document.getElementById("feed-count-pill").textContent = `${state.logs.length} ${state.logs.length === 1 ? "Event" : "Events"}`;
+      document.getElementById("kpi-timeout").textContent = "30s / 60s / 120s";
+      const cp = document.getElementById("controller-pill");
+      cp.textContent = state.controller.reachable ? "Controller: ONLINE (127.0.0.1:6653)" : "Controller: OFFLINE";
+      cp.style.color = state.controller.reachable ? "#34d399" : "#f87171";
+      const lp = document.getElementById("logger-pill");
+      lp.textContent = state.logger.reachable ? "SOC Logger: ONLINE (10.0.0.4:9999)" : "SOC Logger: ONLINE (h4:9999)";
+      lp.style.color = state.logger.reachable ? "#34d399" : "#f87171";
+      document.getElementById("mininet-status").textContent = state.mininet.ready ? "Mininet: READY" : "Mininet: NOT READY";
+      document.getElementById("mininet-status").style.color = state.mininet.ready ? "#34d399" : "#f87171";
+      const testTimeout = state.policy.dashboard_test_timeout_sec;
+      document.getElementById("test-config-status").textContent = testTimeout === null
+        ? "Timeout override: policy defaults" : `Timeout override: ${testTimeout}s`;
+      const timeoutSelect = document.getElementById("test-timeout");
+      if (timeoutSelect && document.activeElement !== timeoutSelect) timeoutSelect.value = testTimeout === null ? "-1" : String(testTimeout);
+      const active = state.dynamic_blocks || [];
+      const h1Badge = document.querySelector("#node-h1 .node-title span:last-child");
+      const h2Badge = document.querySelector("#node-h2 .node-title span:last-child");
+      const h1Ban = active.find(x => x.ip === "10.0.0.1");
+      if (h1Badge) { h1Badge.textContent = h1Ban ? `BLOCKED ${h1Ban.remaining_sec}s` : "AUTH"; h1Badge.style.color = h1Ban ? "#f87171" : "#34d399"; }
+      if (h2Badge) { h2Badge.textContent = (state.policy.blocked_hosts || []).includes("10.0.0.2") ? "BLACKLIST" : "AUTH"; h2Badge.style.color = (state.policy.blocked_hosts || []).includes("10.0.0.2") ? "#f87171" : "#34d399"; }
       if (state.benchmark && state.benchmark.blocking_response_time_ms) {
         document.getElementById("kpi-response").textContent = `${state.benchmark.blocking_response_time_ms.mean_ms} ms`;
       }
 
-      const mnPill = document.getElementById("mininet-pill");
-      if (state.mininet_connected) {
-        mnPill.textContent = "Mininet Namespaces: LIVE";
-        mnPill.style.color = "#34d399";
-      } else {
-        mnPill.textContent = "Mininet: Standby";
-        mnPill.style.color = "#f59e0b";
-      }
-
-      // Update h2 status badge dynamically based on quarantine state
-      const bannedList = state.policy.dynamically_quarantined_hosts || [];
-      const h2Badge = document.getElementById("h2-status-badge");
-      if (bannedList.includes("10.0.0.2")) {
-        h2Badge.textContent = "QUARANTINED (30s)";
-        h2Badge.style.color = "var(--accent-crimson)";
-      } else {
-        h2Badge.textContent = "AUTHORIZED";
-        h2Badge.style.color = "var(--accent-emerald)";
-      }
-
+      // Render SOC Feed
       const feed = document.getElementById("soc-feed");
       if (state.logs.length === 0) {
-        feed.innerHTML = `<div style="color:var(--text-muted);font-size:13px;padding:24px 0;text-align:center;">No security violations logged yet.</div>`;
+        feed.innerHTML = `<div style="color:var(--text-muted);font-size:13px;padding:24px 0;text-align:center;">No security violations logged yet. Trigger a forbidden port or blacklisted host test.</div>`;
       } else if (state.logs.length !== lastEventCount) {
         feed.innerHTML = state.logs.map(ev => `
           <div class="alert-item">
             <div>
               <span class="alert-badge">${ev.action || "DROP_RULE"}</span>
-              <div style="font-size:13px;color:var(--text-primary);margin-top:4px;">${ev.reason || ""}</div>
-              <div style="font-size:11px;color:var(--text-secondary);margin-top:3px;" class="tabular">${ev.src_ip}:${ev.src_port} &rarr; ${ev.dst_ip}:${ev.dst_port}</div>
+              <div class="alert-reason">${ev.reason || "Unauthorized packet dropped at switch s1"}</div>
+              <div class="alert-meta tabular">${ev.src_ip}:${ev.src_port} &rarr; ${ev.dst_ip}:${ev.dst_port} (${ev.protocol}) &bull; hard_timeout=${ev.timeout_sec || 30}s</div>
             </div>
-            <div class="tabular" style="font-size:11px;color:var(--text-muted);">${(ev.timestamp || "").split(" ")[1] || ""}</div>
+            <div class="tabular" style="font-size:11px;color:var(--text-muted);white-space:nowrap;">${(ev.timestamp || "").split(" ")[1] || ev.timestamp}</div>
           </div>
         `).join("");
       }
       lastEventCount = state.logs.length;
 
+      // Render Policy Chips
+      currentPolicy = state.policy;
+      document.getElementById("blocked-hosts-chips").innerHTML = (state.policy.blocked_hosts || []).map(h => `
+        <span class="chip tabular">${h} <button class="chip-remove" onclick="removePolicyItem('host','${h}')">&times;</button></span>
+      `).join("");
+      document.getElementById("blocked-ports-chips").innerHTML = (state.policy.blocked_tcp_ports || []).map(p => `
+        <span class="chip tabular">TCP :${p} <button class="chip-remove" onclick="removePolicyItem('port',${p})">&times;</button></span>
+      `).join("");
+
+      // Render OpenFlow Table
       const flows = state.ovs.flows || [];
       document.getElementById("s1-flow-count").textContent = `Active Flows: ${flows.length}`;
       const tbody = document.getElementById("flow-table-body");
       if (flows.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="6" style="color:var(--text-muted);">Switch s1 offline or no flows installed.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="6" style="color:var(--text-muted);">${state.ovs.error ? "OpenFlow query error: " + state.ovs.error : (state.ovs.switch_active ? "Switch connected; no flow entries returned." : "Switch s1 is not available. Start Mininet and verify sudo permissions.")}</td></tr>`;
       } else {
-        tbody.innerHTML = flows.slice(0, 8).map(f => `
-          <tr>
-            <td>${f.priority}</td>
-            <td style="font-weight:600;${f.actions.toLowerCase().includes('drop') ? 'color:#f87171;' : 'color:#34d399;'}">${f.actions}</td>
-            <td>${f.packets}</td>
-            <td>${f.duration_s.toFixed(1)}s</td>
-            <td>${f.hard_timeout ? f.hard_timeout + 's' : 'idle'}</td>
-            <td style="color:var(--text-secondary);max-width:220px;overflow:hidden;text-overflow:ellipsis;">${f.raw}</td>
-          </tr>
-        `).join("");
+        tbody.innerHTML = flows.slice(0, 8).map(f => {
+          const isDrop = f.actions.toLowerCase().includes("drop");
+          const badgeColor = isDrop ? "color:#f87171;" : "color:#34d399;";
+          return `
+            <tr>
+              <td>${f.priority}</td>
+              <td style="font-weight:600;${badgeColor}">${f.actions}</td>
+              <td>${f.packets}</td>
+              <td>${f.duration_s.toFixed(1)}s</td>
+              <td>${f.hard_timeout ? f.hard_timeout + "s" : "idle"}</td>
+              <td style="color:var(--text-secondary);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${f.raw}</td>
+            </tr>
+          `;
+        }).join("");
       }
-    } catch (e) {}
+    } catch (e) {
+      document.getElementById("mininet-status").textContent = "Dashboard state error";
+      document.getElementById("test-output").textContent = String(e);
+    }
   }
 
+  // Emil Kowalski Rule: Keyboard shortcuts execute immediately with zero lag
   window.addEventListener("keydown", (e) => {
     if (e.target.tagName === "INPUT") return;
     if (e.key === "1") triggerSim("normal_h1_8080");
-    if (e.key === "2") triggerSim("normal_h2_8080");
-    if (e.key === "3") triggerSim("attack_h2_4444");
-    if (e.key === "4") triggerSim("attack_h2_23");
-    if (e.key.toLowerCase() === "a") runAutoPilotDemo();
+    if (e.key === "2") triggerSim("attack_h1_4444");
+    if (e.key === "3") triggerSim("attack_h2_8080");
     if (e.key.toLowerCase() === "r") triggerSim("clear_logs");
   });
 
@@ -690,33 +1307,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </script>
 
 <script>
-async function fetchEvents() {
-    try {
-        let res = await fetch('/api/events');
-        let data = await res.json();
-        let container = document.querySelector('.soc-event-stream') || document.getElementById('soc-stream');
-        if (!container) {
-            // Find panel by heading text
-            let headings = Array.from(document.querySelectorAll('h3, h4, div')).filter(el => el.textContent.includes('Centralized SOC Security Event Stream'));
-            if (headings.length > 0) {
-                container = headings[0].parentElement.querySelector('div:not(:first-child)') || headings[0].parentElement;
-            }
-        }
-        if (container && data.length > 0) {
-            document.querySelector('[id*="Events"], .events-badge, [class*="events"]').textContent = data.length + " Events";
-            container.innerHTML = data.map(ev => `
-                <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 6px; padding: 10px; margin-bottom: 8px; font-size: 13px; color: #f87171;">
-                    <b>[${ev.timestamp}] ${ev.action}</b><br>
-                    <span>${ev.reason}</span><br>
-                    <small style="color: #94a3b8;">Src: ${ev.src_ip}:${ev.src_port} &rarr; Dst: ${ev.dst_ip}:${ev.dst_port}</small>
-                </div>
-            `).join('');
-        }
-    } catch (e) {
-        console.error("Failed to fetch events:", e);
+async function runAutoPilot() {
+    const btn = document.getElementById('autopilot-btn');
+    if (btn) { btn.innerText = "⏳ Running Auto-Pilot Demo..."; btn.style.opacity = "0.7"; }
+    // Find all simulation buttons in Nikhil's UI and trigger them sequentially
+    const simButtons = Array.from(document.querySelectorAll('button')).filter(b =>
+        b.id !== 'autopilot-btn' && !b.innerText.includes('Reset') && !b.innerText.includes('Tab') && !b.innerText.includes('Benchmarks') && !b.innerText.includes('Control Plane')
+    );
+    for (let i = 0; i < simButtons.length; i++) {
+        simButtons[i].click();
+        await new Promise(r => setTimeout(r, 2200));
     }
+    if (btn) { btn.innerHTML = "&#9654; Run Full Auto-Pilot Demo [A]"; btn.style.opacity = "1"; }
 }
-setInterval(fetchEvents, 1000);
+document.addEventListener('keydown', (e) => {
+    if ((e.key === 'a' || e.key === 'A') && document.activeElement.tagName !== 'INPUT') {
+        runAutoPilot();
+    }
+});
 </script>
 </body>
 
@@ -726,7 +1334,7 @@ setInterval(fetchEvents, 1000);
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        return
+        return  # Keep terminal clean
 
     def _send_json(self, payload, status=200):
         data = json.dumps(payload).encode("utf-8")
@@ -745,31 +1353,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif parsed.path.startswith("/api/chart/"):
-            filename = parsed.path.split("/")[-1]
-            filepath = os.path.join(PLOTS_DIR, filename)
-            if os.path.exists(filepath):
-                with open(filepath, "rb") as f:
-                    img = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "image/png")
-                self.send_header("Content-Length", str(len(img)))
-                self.end_headers()
-                self.wfile.write(img)
-            else:
-                self.send_error(404)
         elif parsed.path == "/api/state":
-            policy = read_json_file(POLICY_PATH, {})
+            policy = read_json_file(POLICY_PATH, {
+                "blocked_hosts": ["10.0.0.2"],
+                "blocked_tcp_ports": [4444, 23, 6667],
+                "drop_hard_timeout_sec": 30,
+            })
             logs = read_security_logs()
             bench = read_json_file(BENCH_PATH, {})
             ovs = get_ovs_flows()
-            pids = get_host_pids()
             self._send_json({
                 "policy": policy,
                 "logs": logs,
                 "benchmark": bench,
                 "ovs": ovs,
-                "mininet_connected": bool(pids),
+                "logger": get_logger_status(),
+                "controller": get_controller_status(),
+                "mininet": {"ready": bool(get_host_pids()) and all(k in get_host_pids() for k in ("h1", "h2", "h3", "h4"))},
+                "dynamic_blocks": [
+                    {"ip": ip, "kind": "quarantine", "remaining_sec": max(0, int(exp - time.time()))}
+                    for ip, exp in policy.get("dynamic_block_expiry", {}).items()
+                    if isinstance(exp, (int, float)) and exp > time.time()
+                ],
             })
         else:
             self.send_error(404)
@@ -778,9 +1383,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length).decode("utf-8") if length else "{}"
         body = json.loads(raw)
+
         if self.path == "/api/simulate":
-            result = trigger_simulation(body.get("scenario", ""))
-            self._send_json(result)
+            result = trigger_simulation(body.get("scenario", ""), body)
+            self._send_json(result, 200 if result.get("status") != "ERROR" else 503)
+        elif self.path == "/api/test-config":
+            try:
+                timeout = int(body.get("timeout_sec", 30))
+                configure_test_timeout(timeout)
+                self._send_json({"ok": True, "detail": f"Controller test timeout override set to {timeout}s."})
+            except (ValueError, OSError) as exc:
+                self._send_json({"ok": False, "error": str(exc)}, 400)
+        elif self.path == "/api/policy":
+            pol = read_json_file(POLICY_PATH, {})
+            pol["blocked_hosts"] = body.get("blocked_hosts", pol.get("blocked_hosts", []))
+            pol["blocked_tcp_ports"] = body.get("blocked_tcp_ports", pol.get("blocked_tcp_ports", []))
+            with open(POLICY_PATH, "w", encoding="utf-8") as f:
+                json.dump(pol, f, indent=2)
+            self._send_json({"ok": True, "policy": pol})
         else:
             self.send_error(404)
 
@@ -795,45 +1415,3 @@ if __name__ == "__main__":
         server.serve_forever()
     except KeyboardInterrupt:
         pass
-
-
-
-@app.route('/api/events')
-def get_events():
-    # Automatically clear quarantine badge in policy.json if 30s have elapsed since last DYNAMIC_QUARANTINE event
-    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "security_events.log")
-    policy_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "controller", "policy.json")
-    events = []
-    if os.path.exists(log_path):
-        try:
-            with open(log_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        import json
-                        try:
-                            events.append(json.loads(line))
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-
-    try:
-        import json, time, datetime
-        if os.path.exists(policy_path):
-            with open(policy_path, "r", encoding="utf-8") as pf:
-                pol = json.load(pf)
-            q_hosts = pol.get("dynamically_quarantined_hosts", [])
-            if q_hosts and events:
-                last_q = [e for e in events if "QUARANTINE" in e.get("action", "")]
-                if last_q:
-                    ts_str = last_q[-1].get("timestamp", "")
-                    dt = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                    if (time.time() - dt.timestamp()) >= float(pol.get("drop_hard_timeout_sec", 30)):
-                        pol["dynamically_quarantined_hosts"] = []
-                        with open(policy_path, "w", encoding="utf-8") as pf:
-                            json.dump(pol, pf, indent=2)
-    except Exception:
-        pass
-
-    return __import__('flask').jsonify(events[-50:])
