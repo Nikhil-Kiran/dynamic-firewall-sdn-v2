@@ -25,7 +25,9 @@
     8080,
     9999
   ],
-  "dynamically_quarantined_hosts": [],
+  "dynamically_quarantined_hosts": [
+    "10.0.0.2"
+  ],
   "port_scan_threshold": 5,
   "scan_window_sec": 10,
   "flood_threshold": 20,
