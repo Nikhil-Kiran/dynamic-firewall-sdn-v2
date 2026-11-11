@@ -263,7 +263,10 @@ class DynamicFirewallController(app_manager.OSKenApp):
         in_port = msg.match["in_port"]
 
         pkt = packet.Packet(msg.data)
-        eth = pkt.get_protocols(ethernet.ethernet)[0]
+        eth_packets = pkt.get_protocols(ethernet.ethernet)
+        if not eth_packets:
+            return
+        eth = eth_packets[0]
 
         if eth.ethertype in (ether_types.ETH_TYPE_LLDP, ether_types.ETH_TYPE_IPV6):
             return

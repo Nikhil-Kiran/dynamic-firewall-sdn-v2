@@ -1,136 +1,98 @@
 #!/usr/bin/env python3
 """
-Upgraded Non-Blocking TCP Security Event Client (Socket-SDN Integration Bridge)
-Supports both OS-Ken eventlet green-threads and standard POSIX threads.
+Fault-tolerant asynchronous SOC telemetry client.
+Based on the latest GitHub logger fallback implementation, with a compatibility
+adapter for the keyword-based calls used by the enhanced local IPS controller.
 """
-
-import argparse
-import datetime
 import json
 import os
 import socket
-import sys
 import threading
+import time
 
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_LOG_FILE = os.path.join(BASE_DIR, "security_events.log")
 DEFAULT_LOGGER_IP = os.environ.get("SDN_LOGGER_IP", "10.0.0.4")
 DEFAULT_LOGGER_PORT = int(os.environ.get("SDN_LOGGER_PORT", "9999"))
+_file_lock = threading.Lock()
 
 
-def _transmit_event_sync(payload: dict, logger_ip: str, logger_port: int, timeout: float = 5.0) -> bool:
-    """Internal synchronous helper transmitting JSON telemetry over TCP."""
+def _persist_fallback(payload_dict: dict, log_file: str = DEFAULT_LOG_FILE):
+    """Persist locally if SOC logger delivery fails; avoid recent duplicates."""
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            sock.connect((logger_ip, logger_port))
-            message = json.dumps(payload) + "\n"
-            sock.sendall(message.encode("utf-8"))
-            response = b""
-            while b"\n" not in response and len(response) < 4096:
-                chunk = sock.recv(1024)
-                if not chunk:
-                    break
-                response += chunk
-            if not response:
-                raise socket.timeout("Logger did not acknowledge the event")
-            try:
-                ack = json.loads(response.split(b"\n", 1)[0].decode("utf-8"))
-            except (ValueError, UnicodeDecodeError) as exc:
-                raise OSError(f"Invalid logger acknowledgement: {exc}") from exc
-            if ack.get("status") != "ACK":
-                raise OSError(f"Logger rejected event: {ack}")
-        return True
-    except (socket.timeout, ConnectionRefusedError, OSError) as exc:
-        print(f"[LOG_CLIENT WARN] Unable to deliver security event to Logger at {logger_ip}:{logger_port} -> {exc}", flush=True)
-        return False
+        with _file_lock:
+            line_str = json.dumps(payload_dict)
+            if os.path.exists(log_file):
+                with open(log_file, "r", encoding="utf-8") as rf:
+                    recent = rf.readlines()[-5:]
+                if any(
+                    payload_dict.get("timestamp") in row
+                    and payload_dict.get("src_ip") in row
+                    and str(payload_dict.get("dst_port")) in row
+                    for row in recent
+                ):
+                    return
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(line_str + "\n")
+                f.flush()
+    except Exception as exc:
+        print(f"[LOG_CLIENT WARN] Local fallback persistence failed: {exc}", flush=True)
 
 
 def send_security_event(
-    src_ip: str = "0.0.0.0",
-    dst_ip: str = "0.0.0.0",
-    dst_port: int = 0,
-    action: str = "DROP_FLOW_INSTALLED",
-    reason: str = "Security policy violation",
-    src_port: int = 0,
-    protocol: str = "TCP",
-    event_type: str = "SDN_FIREWALL_RULE",
-    timeout_sec: int = 30,
+    event_data=None,
     logger_ip: str = DEFAULT_LOGGER_IP,
     logger_port: int = DEFAULT_LOGGER_PORT,
-    async_send: bool = True,
+    timeout: float = 0.8,
+    **kwargs,
 ) -> bool:
     """
-    Dispatches structured security telemetry to the centralized TCP Logger.
-    Automatically uses eventlet green-threads if loaded inside OS-Ken, or daemon threads otherwise.
+    Queue a JSON event for asynchronous delivery to h4:9999.
+
+    Accepts both the latest GitHub API:
+        send_security_event(event_dict, logger_ip=..., logger_port=...)
+    and the enhanced controller API:
+        send_security_event(src_ip=..., dst_ip=..., action=..., async_send=True, ...)
     """
-    payload = {
-        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-        "event_type": event_type,
-        "action": action,
-        "src_ip": src_ip,
-        "src_port": src_port,
-        "dst_ip": dst_ip,
-        "dst_port": dst_port,
-        "protocol": protocol,
-        "reason": reason,
-        "timeout_sec": timeout_sec,
-    }
+    payload = dict(event_data) if isinstance(event_data, dict) else {}
+    async_send = kwargs.pop("async_send", True)  # delivery is intentionally always asynchronous
+    payload.update(kwargs)
+    payload.setdefault("timestamp", time.strftime("%Y-%m-%d %H:%M:%S"))
+    payload.setdefault("event_type", "SDN_FIREWALL_RULE")
 
-    if async_send:
-        if "eventlet" in sys.modules:
-            import eventlet
-            eventlet.spawn_n(_transmit_event_sync, payload, logger_ip, logger_port)
-        else:
-            worker = threading.Thread(
-                target=_transmit_event_sync,
-                args=(payload, logger_ip, logger_port),
-                daemon=True,
-            )
-            worker.start()
-        return True
-    else:
-        return _transmit_event_sync(payload, logger_ip, logger_port)
+    def _worker():
+        wire_data = (json.dumps(payload) + "\n").encode("utf-8")
+        delivered = False
+        targets = [logger_ip]
+        if logger_ip != "127.0.0.1":
+            targets.append("127.0.0.1")
+        for target_ip in targets:
+            try:
+                with socket.create_connection((target_ip, int(logger_port)), timeout=timeout) as sock:
+                    sock.sendall(wire_data)
+                    delivered = True
+                    break
+            except Exception:
+                continue
 
+        # The SOC server also writes to the shared log file. This fallback
+        # covers logger outages and deduplicates events already persisted by h4.
+        if delivered:
+            time.sleep(0.05)
+        _persist_fallback(payload)
 
-# Alias for teammates who call log_event(dict) or send_event(...)
-def send_event(event_dict: dict, logger_ip: str = DEFAULT_LOGGER_IP, logger_port: int = DEFAULT_LOGGER_PORT) -> bool:
-    """Flexible dict-based wrapper in case firewall_controller passes a custom dictionary."""
-    return send_security_event(
-        src_ip=event_dict.get("src_ip", "0.0.0.0"),
-        dst_ip=event_dict.get("dst_ip", "0.0.0.0"),
-        dst_port=int(event_dict.get("dst_port", 0)),
-        src_port=int(event_dict.get("src_port", 0)),
-        action=event_dict.get("action", "DROP"),
-        reason=event_dict.get("reason", event_dict.get(" details", "Policy violation")),
-        protocol=event_dict.get("protocol", "TCP"),
-        event_type=event_dict.get("event_type", "SDN_FIREWALL_RULE"),
-        logger_ip=logger_ip,
-        logger_port=logger_port,
-    )
+    threading.Thread(target=_worker, daemon=True).start()
+    return True
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Test dispatching a security event to log_server.py")
-    parser.add_argument("--logger-ip", default="127.0.0.1", help="Logger IP address")
-    parser.add_argument("--logger-port", type=int, default=9999, help="Logger TCP port")
-    parser.add_argument("--src-ip", default="10.0.0.1", help="Source IP")
-    parser.add_argument("--dst-ip", default="10.0.0.3", help="Destination IP")
-    parser.add_argument("--dst-port", type=int, default=4444, help="Destination Port")
-    parser.add_argument("--action", default="DROP_FLOW_INSTALLED", help="Action enforced")
-    parser.add_argument("--reason", default="Forbidden TCP port violation", help="Violation reason")
-    args = parser.parse_args()
+class LogClient:
+    def __init__(self, host: str = DEFAULT_LOGGER_IP, port: int = DEFAULT_LOGGER_PORT, timeout: float = 0.8):
+        self.host = host
+        self.port = int(port)
+        self.timeout = timeout
 
-    print(f"[TEST CLIENT] Dispatching test telemetry to {args.logger_ip}:{args.logger_port}...")
-    success = send_security_event(
-        src_ip=args.src_ip,
-        dst_ip=args.dst_ip,
-        dst_port=args.dst_port,
-        action=args.action,
-        reason=args.reason,
-        logger_ip=args.logger_ip,
-        logger_port=args.logger_port,
-        async_send=False,
-    )
-    if success:
-        print("[TEST SUCCESS] Telemetry acknowledged by log_server.py!")
-    else:
-        print("[TEST FAILED] Ensure log_server.py is running.")
+    def send_event(self, event_dict: dict) -> bool:
+        return send_security_event(event_dict, logger_ip=self.host, logger_port=self.port, timeout=self.timeout)
+
+    def log(self, **kwargs) -> bool:
+        return send_security_event(logger_ip=self.host, logger_port=self.port, timeout=self.timeout, **kwargs)
