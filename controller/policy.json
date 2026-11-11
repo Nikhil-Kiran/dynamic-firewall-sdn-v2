@@ -3,33 +3,16 @@
     8080,
     9999
   ],
-  "allowed_ports": [
-    8080,
-    9999
-  ],
   "forbidden_tcp_ports": [
     23,
     4444
   ],
-  "blocked_ports": [
-    23,
-    4444
-  ],
-  "blocked_hosts": [
-    "10.0.0.2"
-  ],
-  "dynamically_quarantined_hosts": [],
   "max_port_violations_before_quarantine": 2,
-  "port_scan_threshold": 2,
   "syn_flood_threshold": 25,
-  "rate_limit_threshold": 25,
   "syn_flood_window_sec": 3.0,
-  "rate_limit_window_sec": 3.0,
   "drop_hard_timeout_sec": 30,
-  "port_scan_timeout": 30,
-  "flood_timeout": 60,
-  "repeat_offender_timeout": 120,
   "allow_idle_timeout_sec": 60,
   "logger_ip": "10.0.0.4",
-  "logger_port": 9999
+  "logger_port": 9999,
+  "dynamically_quarantined_hosts": []
 }
