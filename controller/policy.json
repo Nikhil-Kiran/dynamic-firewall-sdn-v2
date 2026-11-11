@@ -17,9 +17,7 @@
     "10.0.0.2"
   ],
   "blocked_tcp_ports": [
-    4444,
-    23,
-    6667
+    23
   ],
   "allowed_tcp_ports": [
     8080,
