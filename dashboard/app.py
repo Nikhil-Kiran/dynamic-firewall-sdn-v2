@@ -369,7 +369,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <div class="tabs-bar">
   <button class="tab-btn active" onclick="switchTab('pane-control', this)">Live Control Plane &amp; Real Packet Simulator</button>
-  <button class="tab-btn" onclick="switchTab('pane-benchmarks', this)">System Performance Performance Benchmarks (Graphs)</button>
+  <button class="tab-btn" onclick="switchTab('pane-benchmarks', this)">System Performance Benchmarks (Graphs)</button>
 </div>
 
 <main class="container">
@@ -483,7 +483,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </section>
   </div>
 
-  <!-- PANE 2: System Performance Performance Benchmarks -->
+  <!-- PANE 2: System Performance Benchmarks -->
   <div class="tab-pane" id="pane-benchmarks">
     <div class="card" style="margin-bottom:16px;">
       <div class="section-title">System Performance Evaluation &amp; Security Benchmarks</div>
